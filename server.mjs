@@ -4,10 +4,12 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClient } from '@libsql/client';
+import { computeInsights } from './insights.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const port = Number(process.env.PORT || 5181);
 const checkEveryMs = Number(process.env.CHECK_INTERVAL_MS || 12 * 60 * 60 * 1000);
+const tflKey = process.env.TFL_APP_KEY || ''; // optional; area data still works without it
 
 // Database selection:
 //  - In production, set TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN) and data lives
@@ -30,6 +32,10 @@ async function initialise() {
     property_id TEXT NOT NULL, person TEXT NOT NULL, verdict TEXT, note TEXT,
     updated_at TEXT NOT NULL, PRIMARY KEY(property_id, person),
     FOREIGN KEY(property_id) REFERENCES properties(id)
+  );
+  CREATE TABLE IF NOT EXISTS insights (
+    property_id TEXT PRIMARY KEY, data TEXT NOT NULL, computed_at TEXT NOT NULL,
+    FOREIGN KEY(property_id) REFERENCES properties(id)
   );`);
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
   if (!count) await seed();
@@ -51,12 +57,37 @@ async function seed() {
 async function rows(person) {
   const properties = (await db.execute('SELECT * FROM properties ORDER BY created_at DESC')).rows;
   const feedback = (await db.execute('SELECT property_id, person, verdict, note, updated_at FROM feedback')).rows;
-  return properties.map(p => ({
-    ...p,
-    tags: String(p.tags).split('|'),
-    feedback: feedback.filter(f => f.property_id === p.id),
-    mine: feedback.find(f => f.property_id === p.id && f.person === person) || null,
-  }));
+  const insights = (await db.execute('SELECT property_id, data FROM insights')).rows;
+  return properties.map(p => {
+    const ins = insights.find(i => i.property_id === p.id);
+    return {
+      ...p,
+      tags: String(p.tags).split('|'),
+      feedback: feedback.filter(f => f.property_id === p.id),
+      mine: feedback.find(f => f.property_id === p.id && f.person === person) || null,
+      insights: ins ? JSON.parse(ins.data) : null,
+    };
+  });
+}
+
+// Compute live area intelligence for every property and cache it in the DB.
+// Sequential with a gap so we stay gentle on the shared public APIs (esp. Overpass).
+async function refreshInsights() {
+  const props = (await db.execute('SELECT id, area, price, latitude, longitude FROM properties')).rows;
+  const done = [];
+  for (const p of props) {
+    try {
+      const data = await computeInsights(p, { tflKey });
+      await db.execute({
+        sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?)
+              ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`,
+        args: [p.id, JSON.stringify(data), data.computedAt],
+      });
+      done.push({ id: p.id, sources: data.sources.length });
+    } catch (e) { done.push({ id: p.id, error: String(e && e.message || e) }); }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  return done;
 }
 
 function send(res, code, body, type = 'application/json; charset=utf-8') { res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store' }); res.end(body); }
@@ -88,7 +119,8 @@ async function refresh() {
       results.push({ id: item.id, status: 'needs-check' });
     }
   }
-  return results;
+  const insights = await refreshInsights().catch(() => []);
+  return { availability: results, insights };
 }
 
 function staticFile(pathname) {
@@ -126,5 +158,15 @@ createServer(async (req, res) => {
   try { return send(res, 200, await readFile(file), types[extname(file)] || 'application/octet-stream'); }
   catch { return send(res, 500, 'Could not load file', 'text/plain; charset=utf-8'); }
 }).listen(port, () => console.log(`Nest is running at http://127.0.0.1:${port}`));
+
+// On first boot (or after adding a home), fill any missing area intelligence in
+// the background so it's ready without the user pressing anything.
+(async () => {
+  try {
+    const have = (await db.execute('SELECT COUNT(*) AS n FROM insights')).rows[0].n;
+    const total = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
+    if (have < total) { console.log('Computing area intelligence in the background…'); await refreshInsights(); console.log('Area intelligence ready.'); }
+  } catch (e) { console.log('Area-intelligence bootstrap skipped:', e && e.message); }
+})();
 
 setInterval(() => refresh().catch(() => {}), checkEveryMs).unref();
