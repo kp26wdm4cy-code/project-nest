@@ -209,13 +209,22 @@ function renderDetail() {
   const mine = p.mine || {};
   const pv = partnerVerdict(p);
   const av = availInfo(p);
-  box.innerHTML = `<div>
+  const med = p.media || {};
+  const shots = [...(med.photos || []), ...(med.floorplans || [])];
+  const gallery = shots.length ? `<div class="gallery">
+      <img id="galMain" class="gallery-main" src="${shots[0]}" referrerpolicy="no-referrer" alt="Listing photo of ${p.name}">
+      <div class="gallery-strip">
+        ${(med.photos || []).map((u, i) => `<button class="thumb${i === 0 ? ' active' : ''}" data-src="${u}"><img src="${u}" referrerpolicy="no-referrer" alt="" loading="lazy"></button>`).join('')}
+        ${(med.floorplans || []).map(u => `<button class="thumb floor" data-src="${u}" title="Floorplan"><img src="${u}" referrerpolicy="no-referrer" alt="Floorplan" loading="lazy"><span>PLAN</span></button>`).join('')}
+      </div>
+    </div>` : '';
+  box.innerHTML = `${gallery}<div>
     <div class="detail-heading">
       <div>
         <p class="kicker">NEST'S VIEW · ${p.confidence.toUpperCase()} CONFIDENCE</p>
         <h2>${p.name}<br><em>${p.recommendation === 'View' ? 'Worth seeing first.' : 'Worth a closer look.'}</em></h2>
       </div>
-      <button id="openListing" class="listing-button">Photos + floor plan ↗</button>
+      <a class="listing-button" href="${p.listing_url}" target="_blank" rel="noreferrer">Open full listing ↗</a>
     </div>
     <p class="facts">${p.area} · ${money(p.price)} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}
       <span class="avail ${av.cls} big">${av.text}</span><span class="checked">${whenChecked(p.last_checked)}</span></p>
@@ -230,7 +239,11 @@ function renderDetail() {
     <textarea id="note" placeholder="What works or puts you off? e.g. 'living room feels dark'">${mine.note || ''}</textarea>
     <div class="saved-note" id="savedNote">${mine.verdict || mine.note ? 'Saved on the shared server.' : ''}</div>
   </div>`;
-  document.getElementById('openListing').onclick = () => openListing(p);
+  box.querySelectorAll('.thumb').forEach(t => t.onclick = () => {
+    document.getElementById('galMain').src = t.dataset.src;
+    box.querySelectorAll('.thumb').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+  });
   box.querySelectorAll('[data-verdict]').forEach(b => b.onclick = () => onVerdict(p, b.dataset.verdict));
   document.getElementById('note').addEventListener('change', async e => {
     try { await saveFeedback(p, { note: e.target.value }); document.getElementById('savedNote').textContent = 'Note saved on the shared server.'; renderLearning(); }
@@ -246,11 +259,6 @@ async function onVerdict(p, verdict) {
   } catch {
     const s = document.getElementById('savedNote'); if (s) s.textContent = 'Could not save — is the server running?';
   }
-}
-
-function openListing(p) {
-  document.getElementById('listingLink').href = p.listing_url;
-  document.getElementById('listingDialog').showModal();
 }
 
 function renderLearning() {
@@ -313,7 +321,6 @@ function bind() {
     renderList();
   });
   document.getElementById('briefButton').onclick = () => document.getElementById('brief').scrollIntoView({ behavior: 'smooth' });
-  document.querySelector('.close-dialog').onclick = () => document.getElementById('listingDialog').close();
   document.querySelectorAll('#personSwitch button').forEach(b => b.onclick = () => switchPerson(b.dataset.person));
   document.getElementById('checkListings').onclick = e => checkListings(e.currentTarget);
   renderPersonSwitch();

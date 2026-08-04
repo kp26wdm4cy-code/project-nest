@@ -10,6 +10,29 @@ const root = fileURLToPath(new URL('.', import.meta.url));
 const port = Number(process.env.PORT || 5181);
 const checkEveryMs = Number(process.env.CHECK_INTERVAL_MS || 12 * 60 * 60 * 1000);
 const tflKey = process.env.TFL_APP_KEY || ''; // optional; area data still works without it
+// A realistic browser UA makes the listing pages (and their photos) far more
+// likely to load — some hosts block the default Node fetch UA.
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Pull this listing's own photo + floorplan URLs out of the page HTML. The media
+// URLs embed the listing's numeric id, so we filter to just this property (drops
+// the "similar properties" images) and separate floorplans from photos.
+function extractMedia(html, listingUrl) {
+  const rmId = (String(listingUrl).match(/properties\/(\d+)/) || [])[1];
+  if (!rmId) return { photos: [], floorplans: [], fetchedAt: new Date().toISOString() };
+  const all = [...new Set((html.match(/https:\/\/media\.rightmove\.co\.uk\/[^"'\\ )]+\.(?:jpe?g|png)/gi) || []))]
+    .filter(u => u.includes('/' + rmId + '/'));
+  const floorplans = all.filter(u => /property-floorplan|_FLP_/i.test(u)).slice(0, 3);
+  const photos = all.filter(u => !/property-floorplan|_FLP_|_max_/i.test(u)).slice(0, 24);
+  return { photos, floorplans, fetchedAt: new Date().toISOString() };
+}
+async function storeMedia(id, media) {
+  await db.execute({
+    sql: `INSERT INTO media(property_id,data,fetched_at) VALUES(?,?,?)
+          ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,fetched_at=excluded.fetched_at`,
+    args: [id, JSON.stringify(media), media.fetchedAt],
+  });
+}
 
 // Database selection:
 //  - In production, set TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN) and data lives
@@ -36,6 +59,10 @@ async function initialise() {
   CREATE TABLE IF NOT EXISTS insights (
     property_id TEXT PRIMARY KEY, data TEXT NOT NULL, computed_at TEXT NOT NULL,
     FOREIGN KEY(property_id) REFERENCES properties(id)
+  );
+  CREATE TABLE IF NOT EXISTS media (
+    property_id TEXT PRIMARY KEY, data TEXT NOT NULL, fetched_at TEXT NOT NULL,
+    FOREIGN KEY(property_id) REFERENCES properties(id)
   );`);
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
   if (!count) await seed();
@@ -58,16 +85,33 @@ async function rows(person) {
   const properties = (await db.execute('SELECT * FROM properties ORDER BY created_at DESC')).rows;
   const feedback = (await db.execute('SELECT property_id, person, verdict, note, updated_at FROM feedback')).rows;
   const insights = (await db.execute('SELECT property_id, data FROM insights')).rows;
+  const media = (await db.execute('SELECT property_id, data FROM media')).rows;
   return properties.map(p => {
     const ins = insights.find(i => i.property_id === p.id);
+    const med = media.find(m => m.property_id === p.id);
     return {
       ...p,
       tags: String(p.tags).split('|'),
       feedback: feedback.filter(f => f.property_id === p.id),
       mine: feedback.find(f => f.property_id === p.id && f.person === person) || null,
       insights: ins ? JSON.parse(ins.data) : null,
+      media: med ? JSON.parse(med.data) : null,
     };
   });
+}
+
+// Fetch listing pages to fill any missing galleries (used on first boot).
+async function bootstrapMedia() {
+  const props = (await db.execute("SELECT id, listing_url FROM properties WHERE id NOT IN (SELECT property_id FROM media)")).rows;
+  for (const p of props) {
+    try {
+      const res = await fetch(p.listing_url, { redirect: 'follow', headers: { 'User-Agent': BROWSER_UA, 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' }, signal: AbortSignal.timeout(20000) });
+      const m = extractMedia(await res.text(), p.listing_url);
+      if (m.photos.length || m.floorplans.length) await storeMedia(p.id, m);
+      console.log(`media ${p.id}: ${m.photos.length} photos, ${m.floorplans.length} floorplans`);
+    } catch (e) { console.log(`media ${p.id}: failed (${e && e.message})`); }
+    await new Promise(r => setTimeout(r, 800));
+  }
 }
 
 // Compute live area intelligence for every property and cache it in the DB.
@@ -109,10 +153,13 @@ async function refresh() {
   const results = [];
   for (const item of items) {
     try {
-      const response = await fetch(item.listing_url, { redirect: 'follow', headers: { 'User-Agent': 'Project-Nest listing-status checker/1.0' } });
-      const page = (await response.text()).toLowerCase();
+      const response = await fetch(item.listing_url, { redirect: 'follow', headers: { 'User-Agent': BROWSER_UA, 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' } });
+      const html = await response.text();
+      const page = html.toLowerCase();
       const unavailable = !response.ok || /sold stc|no longer available|property has been removed|this property is no longer/.test(page);
       await db.execute({ sql: 'UPDATE properties SET availability=?, last_checked=? WHERE id=?', args: [unavailable ? 'off-market' : 'available', now, item.id] });
+      // Reuse the page we just downloaded to refresh the photo/floorplan gallery.
+      try { const m = extractMedia(html, item.listing_url); if (m.photos.length || m.floorplans.length) await storeMedia(item.id, m); } catch { /* leave last-good media */ }
       results.push({ id: item.id, status: unavailable ? 'off-market' : 'available' });
     } catch {
       await db.execute({ sql: 'UPDATE properties SET availability=?, last_checked=? WHERE id=?', args: ['needs-check', now, item.id] });
@@ -167,6 +214,8 @@ createServer(async (req, res) => {
     const total = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
     if (have < total) { console.log('Computing area intelligence in the background…'); await refreshInsights(); console.log('Area intelligence ready.'); }
   } catch (e) { console.log('Area-intelligence bootstrap skipped:', e && e.message); }
+  try { console.log('Fetching listing galleries…'); await bootstrapMedia(); console.log('Galleries ready.'); }
+  catch (e) { console.log('Gallery bootstrap skipped:', e && e.message); }
 })();
 
 setInterval(() => refresh().catch(() => {}), checkEveryMs).unref();
