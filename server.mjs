@@ -18,12 +18,12 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 // URLs embed the listing's numeric id, so we filter to just this property (drops
 // the "similar properties" images) and separate floorplans from photos.
 function extractMedia(html, listingUrl) {
-  const rmId = (String(listingUrl).match(/properties\/(\d+)/) || [])[1];
-  if (!rmId) return { photos: [], floorplans: [], fetchedAt: new Date().toISOString() };
-  const all = [...new Set((html.match(/https:\/\/media\.rightmove\.co\.uk\/[^"'\\ )]+\.(?:jpe?g|png)/gi) || []))]
-    .filter(u => u.includes('/' + rmId + '/'));
-  const floorplans = all.filter(u => /property-floorplan|_FLP_/i.test(u)).slice(0, 3);
-  const photos = all.filter(u => !/property-floorplan|_FLP_|_max_/i.test(u)).slice(0, 24);
+  const id = (String(listingUrl).match(/(\d{5,})/) || [])[1]; // rightmove /properties/ID, OTM /details/ID
+  if (!id) return { photos: [], floorplans: [], fetchedAt: new Date().toISOString() };
+  const all = [...new Set((html.match(/https:\/\/media\.(?:rightmove\.co\.uk|onthemarket\.com)\/[^"'\\ )]+\.(?:jpe?g|png)/gi) || []))]
+    .filter(u => u.includes('/' + id + '/'));
+  const floorplans = all.filter(u => /property-floorplan|_FLP_|floorplan/i.test(u)).slice(0, 3);
+  const photos = all.filter(u => !/property-floorplan|_FLP_|floorplan|_max_/i.test(u)).slice(0, 24);
   return { photos, floorplans, fetchedAt: new Date().toISOString() };
 }
 async function storeMedia(id, media) {
@@ -56,24 +56,30 @@ function extractListing(html, href) {
   const title = ogMeta(html, 'title') || '';
   const descr = ogMeta(html, 'description') || '';
   const image = ogMeta(html, 'image');
-  const text = `${descr} ${title}`;
+  const text = `${title} ${descr}`;               // title first — it usually has the price
   const beds = +((text.match(/(\d+)\s*bed/i) || [])[1] || 0) || null;
   const type = (text.match(/bedroom\s+([a-z][a-z-]*)\b/i) || [])[1] || (text.match(/\b(flat|maisonette|apartment|house|studio|bungalow|cottage|duplex)\b/i) || [])[1] || 'home';
   let price = null;
-  const pm = html.match(/primaryPrice"[^>]*><span>£([\d,]+)/) || descr.match(/£\s?([\d,]{4,})/) || html.match(/£\s?([\d,]{4,})/);
+  const pm = text.match(/£\s?([\d,]{4,})/) || html.match(/primaryPrice"[^>]*><span>£([\d,]+)/) || html.match(/£\s?([\d,]{4,})/);
   if (pm) price = +pm[1].replace(/,/g, '');
-  let area = (descr.match(/\bin\s+(.+?)\s+for\s+£/i) || [])[1] || (title.match(/\bin\s+(.+?)(?:\s+for|$)/i) || [])[1] || '';
+  // Location comes from the listing's own OG text (title/description) — never a
+  // whole-page scrape, which is full of postcode-shaped junk (CSS hashes etc).
+  let area = (descr.match(/\bin\s+(.+?)\s+for\s+£/i) || [])[1]                 // "…in Bruce Road, E3 for £…"
+    || (title.match(/^(.+?),?\s*\d+\s*bed\b/i) || [])[1]                       // "Mildmay Grove South, London, N1 2 bed…"
+    || (descr.match(/\bin\s+([A-Za-z0-9 ,'-]+?)(?:\.|$)/i) || [])[1]           // "…for sale in Mildmay Grove South, London, N1"
+    || (title.match(/\bin\s+(.+?)(?:\s+for|$)/i) || [])[1] || '';
   area = area.replace(/,?\s*United Kingdom\s*$/i, '').replace(/\s+/g, ' ').trim();
-  // Read location ONLY from the listing's own description (the page HTML is full
-  // of postcode-shaped junk like CSS hashes). Full postcode if present, else the
-  // outward code (e.g. "E1W") — the last postcode-shaped token in the area text.
-  const pcD = descr.match(/\b([A-Z]{1,2}\d[A-Z\d]?)\s+(\d[A-Z]{2})\b/);
+  const locText = `${area} ${title} ${descr}`;
+  const pcD = locText.match(/\b([A-Z]{1,2}\d[A-Z\d]?)\s+(\d[A-Z]{2})\b/);      // full postcode in the OG text
   const postcode = pcD ? `${pcD[1]} ${pcD[2]}` : null;
   const outcodes = [...area.matchAll(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g)].map(m => m[1]);
   const outcode = outcodes[outcodes.length - 1] || null;
+  // Precise coordinates if the page embeds them (OnTheMarket does); else null.
+  const cm = html.match(/"lat(?:itude)?"\s*:\s*(-?5\d\.\d{3,})[\s\S]{0,40}?"l(?:ng|on|ongitude)"\s*:\s*(-?\d\.\d{3,})/);
+  const coords = cm ? { lat: +cm[1], lng: +cm[2] } : null;
   const media = extractMedia(html, href);
   if (!media.photos.length && image) media.photos = [image];
-  return { title, descr, beds, type, price, area, postcode, outcode, media };
+  return { title, descr, beds, type, price, area, postcode, outcode, coords, media };
 }
 async function addListing(listingUrl) {
   const u = new URL(listingUrl);
@@ -84,8 +90,9 @@ async function addListing(listingUrl) {
   if (!resp.ok) return { error: `That page returned ${resp.status}.` + (/zoopla/i.test(u.hostname) ? ' Zoopla often blocks automated reads — a Rightmove link is most reliable.' : '') };
   const html = await resp.text();
   const ex = extractListing(html, u.href);
-  const geo = await geocode(ex.postcode, ex.outcode);
-  if (!geo) return { error: 'Could not work out the location from that page. A Rightmove link works best.' };
+  let lat = ex.coords ? ex.coords.lat : null, lng = ex.coords ? ex.coords.lng : null, district = null;
+  if (lat == null) { const geo = await geocode(ex.postcode, ex.outcode); if (geo) { lat = geo.lat; lng = geo.lng; district = geo.district; } }
+  if (lat == null) return { error: 'Could not work out the location from that page. A Rightmove link works best.' };
   if (!ex.price) return { error: 'Could not read the price from that page.' };
   const rmId = (u.href.match(/(\d{5,})/) || [])[1];
   const prefix = /rightmove/i.test(u.hostname) ? 'rm-' : /zoopla/i.test(u.hostname) ? 'zp-' : /onthemarket/i.test(u.hostname) ? 'otm-' : 'pl-';
@@ -93,12 +100,12 @@ async function addListing(listingUrl) {
   const exists = (await db.execute({ sql: 'SELECT id FROM properties WHERE id=?', args: [id] })).rows[0];
   const street = (ex.area.split(',')[0] || ex.area || 'Home').trim();
   const name = `${ex.beds ? ex.beds + ' bed ' : ''}${ex.type}, ${street}`.trim();
-  const areaLabel = (ex.area || [geo.district, ex.outcode].filter(Boolean).join(', ') || 'Location').slice(0, 80);
+  const areaLabel = (ex.area || [district, ex.outcode].filter(Boolean).join(', ') || 'Location').slice(0, 80);
   if (!exists) {
     await db.execute({
       sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      args: [id, name, areaLabel, ex.price, ex.beds || 0, 'Size TBC', geo.lat, geo.lng, u.href, 'View', 'Medium',
+      args: [id, name, areaLabel, ex.price, ex.beds || 0, 'Size TBC', lat, lng, u.href, 'View', 'Medium',
         (ex.descr ? ex.descr.replace(/\s+/g, ' ').trim() : 'Added from a listing link.'),
         'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.',
         [ex.type, ex.outcode].filter(Boolean).join('|'), new Date().toISOString()],
@@ -106,7 +113,7 @@ async function addListing(listingUrl) {
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
     (async () => {
       try {
-        const data = await computeInsights({ latitude: geo.lat, longitude: geo.lng, price: ex.price, area: areaLabel }, { tflKey });
+        const data = await computeInsights({ latitude: lat, longitude: lng, price: ex.price, area: areaLabel }, { tflKey });
         await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), data.computedAt] });
       } catch { }
     })();
