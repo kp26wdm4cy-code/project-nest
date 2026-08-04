@@ -33,6 +33,121 @@ function whenChecked(iso) {
     ' · ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 }
 
+// ---- area intelligence ---------------------------------------------------
+// Indicative, editorial reference data per area (NOT live market data or advice).
+// Scores are 0–100 relative reads; priceIndex is an indicative resale index
+// (base 100 at the start of the window); yield is an indicative gross %.
+const INSIGHTS = {
+  'bruce-road': {
+    area: 'Bow, E3',
+    headline: 'Bow keeps gaining from Elizabeth line reach and the Olympic Park regeneration to the east — and this sits at the sensible-value end of the budget.',
+    priceIndex: [100, 106, 112, 121, 128, 126, 131],
+    yield: 4.4,
+    scores: { Transport: 82, 'Green space': 74, Amenities: 70, 'Buzz & demand': 68, 'Relative value': 80 },
+    drivers: [
+      'Elizabeth line reach via Stratford & Whitechapel',
+      'Queen Elizabeth Olympic Park regeneration spillover',
+      'Bromley-by-Bow / Poplar riverside redevelopment underway',
+    ],
+    nearby: [
+      { name: 'Victoria Park', dist: '~15 min walk', why: 'One of London’s finest parks — a lasting driver of nearby demand and weekend life.' },
+      { name: 'Mile End Park & canal', dist: '~8 min walk', why: 'Green corridor and Regent’s Canal towpath for running or cycling into the City.' },
+      { name: 'Roman Road Market', dist: '~12 min walk', why: 'Independent shops plus a Tue/Thu/Sat market keep the high street genuinely local.' },
+    ],
+  },
+  'ermine-house': {
+    area: 'Parnell Road, Bow, E3',
+    headline: 'A Victoria Park–side address: the park and Roman Road anchor demand that has held up better than the wider market.',
+    priceIndex: [100, 108, 115, 124, 132, 130, 135],
+    yield: 4.1,
+    scores: { Transport: 78, 'Green space': 88, Amenities: 82, 'Buzz & demand': 80, 'Relative value': 72 },
+    drivers: [
+      'Victoria Park & Regent’s Canal — durable demand anchors',
+      'Roman Road independent high-street revival',
+      'Elizabeth line + Olympic Park growth to the east',
+    ],
+    nearby: [
+      { name: 'Victoria Park', dist: '~5 min walk', why: 'On the doorstep — the single biggest amenity for this address.' },
+      { name: 'Roman Road Market', dist: '~6 min walk', why: 'Everyday high street with markets and cafés; strong local character.' },
+      { name: 'Broadway Market', dist: '~20 min canal walk', why: 'Saturday food market along the towpath — a classic East London day out.' },
+    ],
+  },
+  'blackhorse-road': {
+    area: 'Walthamstow, E17',
+    headline: 'E17 has been one of London’s strongest risers — Blackhorse Road’s regeneration and the fast Victoria line keep pulling new residents in.',
+    priceIndex: [100, 109, 118, 129, 138, 135, 139],
+    yield: 4.6,
+    scores: { Transport: 88, 'Green space': 90, Amenities: 76, 'Buzz & demand': 84, 'Relative value': 70 },
+    drivers: [
+      'Blackhorse Road regeneration: thousands of new homes + the Beer Mile',
+      'Fast Victoria line to the West End (~20 min)',
+      'Walthamstow Wetlands & William Morris Gallery drawing new residents',
+    ],
+    nearby: [
+      { name: 'Walthamstow Wetlands', dist: '~10 min walk', why: 'Europe’s largest urban wetland reserve — rare protected green space next door.' },
+      { name: 'Blackhorse Beer Mile', dist: '~5 min walk', why: 'Regenerated industrial units, now taprooms & event spaces — the area’s growth engine.' },
+      { name: 'William Morris Gallery & Lloyd Park', dist: '~12 min walk', why: 'Free museum in a Georgian house with a park — a cultural anchor drawing families.' },
+    ],
+  },
+};
+
+// A single-series area/line sparkline — one hue, direct end-marker, no legend.
+function sparkline(series) {
+  const w = 320, h = 92, pad = 8;
+  const min = Math.min(...series), max = Math.max(...series);
+  const xx = i => pad + i * (w - 2 * pad) / (series.length - 1);
+  const yy = v => (h - pad) - ((v - min) / ((max - min) || 1)) * (h - 2 * pad);
+  const pts = series.map((v, i) => `${xx(i).toFixed(1)},${yy(v).toFixed(1)}`);
+  const area = `M${xx(0).toFixed(1)},${(h - pad).toFixed(1)} L${pts.join(' L')} L${xx(series.length - 1).toFixed(1)},${(h - pad).toFixed(1)} Z`;
+  const lx = xx(series.length - 1), ly = yy(series[series.length - 1]);
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" role="img" aria-label="Indicative resale price index, rising over the period">
+    <defs><linearGradient id="sparkfill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7ea573" stop-opacity=".38"/><stop offset="1" stop-color="#7ea573" stop-opacity="0"/></linearGradient></defs>
+    <path d="${area}" fill="url(#sparkfill)"/>
+    <polyline points="${pts.join(' ')}" fill="none" stroke="#285b43" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="4" fill="#285b43" stroke="#fff" stroke-width="1.6"/>
+  </svg>`;
+}
+
+function renderInsights() {
+  const box = document.getElementById('areaInsights');
+  if (!box) return;
+  const p = byId(selectedId);
+  const d = p && INSIGHTS[p.id];
+  if (!d) { box.innerHTML = ''; return; }
+  const change = Math.round(d.priceIndex[d.priceIndex.length - 1] - d.priceIndex[0]);
+  const yLo = 2.5, yHi = 5.5;
+  const yPos = Math.max(4, Math.min(96, (d.yield - yLo) / (yHi - yLo) * 100));
+  const bars = Object.entries(d.scores).map(([k, v]) =>
+    `<div class="scorebar" title="${k}: ${v} / 100 (indicative)"><span>${k}</span><div class="track"><i style="width:${v}%"></i></div><b>${v}</b></div>`).join('');
+  const nearby = d.nearby.map(n =>
+    `<div class="near-card"><div class="near-top"><strong>${n.name}</strong><span class="chip">${n.dist}</span></div><p>${n.why}</p></div>`).join('');
+  box.innerHTML = `
+    <div class="insight-head">
+      <p class="kicker">AREA INTELLIGENCE · ${d.area.toUpperCase()}</p>
+      <h3>${d.headline}</h3>
+    </div>
+    <div class="insight-row">
+      <article class="insight-card">
+        <p class="ic-kicker">RESALE PRICE MOMENTUM</p>
+        <div class="ic-figure"><span class="ic-big">+${change}%</span><span class="ic-sub">indicative index · last ${d.priceIndex.length - 1} yrs</span></div>
+        ${sparkline(d.priceIndex)}
+      </article>
+      <article class="insight-card">
+        <p class="ic-kicker">AREA SCORECARD <span>/ 100</span></p>
+        <div class="scorebars">${bars}</div>
+      </article>
+      <article class="insight-card">
+        <p class="ic-kicker">SIGNALS &amp; FUTURE PULL</p>
+        <div class="ic-figure"><span class="ic-big">${d.yield.toFixed(1)}%</span><span class="ic-sub">indicative gross yield · London band 2.5–5.5%</span></div>
+        <div class="yield-meter" title="Where this sits in a typical London yield band"><i style="left:${yPos}%"></i></div>
+        <ul class="ic-drivers">${d.drivers.map(x => `<li>${x}</li>`).join('')}</ul>
+      </article>
+    </div>
+    <div class="near-head"><p class="kicker">WORTH A DETOUR NEARBY</p></div>
+    <div class="near-row">${nearby}</div>
+    <p class="insight-foot">Indicative area signals compiled for orientation — not live market data or financial advice. Check current figures before relying on them.</p>`;
+}
+
 // ---- data ----------------------------------------------------------------
 async function loadProperties() {
   const res = await fetch(`/api/properties?person=${encodeURIComponent(ui.person)}`, { cache: 'no-store' });
@@ -111,6 +226,7 @@ function select(id) {
   if (map && p) map.flyTo([p.latitude, p.longitude], 14, { duration: .45 });
   renderList();
   renderDetail();
+  renderInsights();
   refreshMarkers();
 }
 
@@ -214,7 +330,7 @@ async function checkListings(btn) {
 }
 
 function renderAll() {
-  renderList(); renderDetail(); refreshMarkers(); renderLearning(); renderLeadNote();
+  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderLeadNote();
 }
 
 function bind() {
