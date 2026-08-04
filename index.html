@@ -45,10 +45,15 @@
     <section class="add-bar" aria-label="Add a listing">
       <div class="add-row">
         <span class="add-plus">＋</span>
-        <input id="addUrl" type="url" inputmode="url" placeholder="Paste a Rightmove, Zoopla or OnTheMarket link to add a home…" autocomplete="off" />
+        <input id="addUrl" type="url" inputmode="url" placeholder="Paste a Rightmove or OnTheMarket link to add a home…" autocomplete="off" />
         <button type="button" id="addBtn" class="lead-btn">Add home</button>
       </div>
-      <p id="addStatus" class="add-status">Adds the home for both of you, and pulls in its photos, floor plan and area intelligence.</p>
+      <div class="add-or">
+        <span class="or-word">or</span>
+        <button type="button" id="discoverBtn" class="lead-btn ghost">✨ Suggest homes that fit us</button>
+        <small>Searches Rightmove and adds the top matches, ranked by what you two have liked so far.</small>
+      </div>
+      <p id="addStatus" class="add-status">Add a home and Nest pulls in its photos, floor plan and area intelligence — or let it suggest homes from what you’ve liked.</p>
     </section>
 
     <section class="workspace" aria-label="Curated property workspace">

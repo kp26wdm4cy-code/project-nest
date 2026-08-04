@@ -81,7 +81,8 @@ function extractListing(html, href) {
   if (!media.photos.length && image) media.photos = [image];
   return { title, descr, beds, type, price, area, postcode, outcode, coords, media };
 }
-async function addListing(listingUrl) {
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function addListing(listingUrl, opts = {}) {
   const u = new URL(listingUrl);
   if (!PORTALS.test(u.hostname)) return { error: 'Please paste a Rightmove, Zoopla, OnTheMarket or PrimeLocation link.' };
   let resp;
@@ -101,14 +102,16 @@ async function addListing(listingUrl) {
   const street = (ex.area.split(',')[0] || ex.area || 'Home').trim();
   const name = `${ex.beds ? ex.beds + ' bed ' : ''}${ex.type}, ${street}`.trim();
   const areaLabel = (ex.area || [district, ex.outcode].filter(Boolean).join(', ') || 'Location').slice(0, 80);
+  const desc = ex.descr ? ex.descr.replace(/\s+/g, ' ').trim() : 'Added from a listing link.';
+  const agentView = opts.reason ? `✨ Suggested for you — ${opts.reason}.\n\n${desc}` : desc;
+  const tags = [ex.type, ex.outcode, opts.reason ? 'suggested' : null].filter(Boolean).join('|');
   if (!exists) {
     await db.execute({
       sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      args: [id, name, areaLabel, ex.price, ex.beds || 0, 'Size TBC', lat, lng, u.href, 'View', 'Medium',
-        (ex.descr ? ex.descr.replace(/\s+/g, ' ').trim() : 'Added from a listing link.'),
+      args: [id, name, areaLabel, ex.price, ex.beds || 0, 'Size TBC', lat, lng, u.href, 'View', 'Medium', agentView,
         'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.',
-        [ex.type, ex.outcode].filter(Boolean).join('|'), new Date().toISOString()],
+        tags, new Date().toISOString()],
     });
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
     (async () => {
@@ -119,6 +122,106 @@ async function addListing(listingUrl) {
     })();
   }
   return { ok: true, id, name, existing: !!exists };
+}
+
+// --- learn taste from verdicts, then discover matching Rightmove listings --
+const STOP = new Set('the a an and or for in on of to is it with this that you your are be from at as we i has have will can not but if so its their there here more into over near just also'.split(' '));
+const outcodesIn = s => (String(s).match(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/gi) || []).map(x => x.toUpperCase());
+async function buildTaste() {
+  const props = (await db.execute('SELECT id, price, area, tags, agent_view FROM properties')).rows;
+  const fb = (await db.execute('SELECT property_id, verdict, note FROM feedback')).rows;
+  const byId = new Map(props.map(p => [p.id, p]));
+  const pos = [], neg = [];
+  for (const f of fb) {
+    const p = byId.get(f.property_id); if (!p) continue;
+    const doc = `${p.area} ${p.tags} ${p.agent_view} ${f.note || ''}`.toLowerCase();
+    if (f.verdict === 'Love' || f.verdict === 'View') pos.push({ p, doc });
+    else if (f.verdict === 'Pass') neg.push({ p, doc });
+  }
+  const areaScore = new Map();
+  pos.forEach(x => outcodesIn(x.p.area).forEach(o => areaScore.set(o, (areaScore.get(o) || 0) + 1)));
+  neg.forEach(x => outcodesIn(x.p.area).forEach(o => areaScore.set(o, (areaScore.get(o) || 0) - 1)));
+  const prices = pos.map(x => x.p.price).filter(Boolean);
+  const priceCenter = prices.length ? prices.reduce((a, b) => a + b, 0) / prices.length : null;
+  const kw = new Map();
+  const tally = (arr, sign) => arr.forEach(x => new Set(x.doc.split(/[^a-z]+/).filter(w => w.length > 3 && !STOP.has(w))).forEach(w => kw.set(w, (kw.get(w) || 0) + sign)));
+  tally(pos, 1); tally(neg, -1);
+  return { areaScore, priceCenter, kw, count: pos.length + neg.length };
+}
+function scoreCandidate(ex, taste, brief) {
+  let score = 0; const why = [];
+  score += (ex.price <= brief.maxPrice) ? 10 : -40;
+  if (ex.beds && brief.beds.includes(ex.beds)) score += 8;
+  const o = (ex.outcode || '').toUpperCase();
+  const a = taste.areaScore.get(o) || 0;
+  if (a > 0) { score += 16 * a; why.push(`${o}, an area you’ve liked`); }
+  else if (a < 0) { score += 12 * a; }
+  if (taste.priceCenter) { const d = Math.abs(ex.price - taste.priceCenter) / taste.priceCenter; score += Math.max(0, 12 - d * 24); if (d < 0.12) why.push('priced like ones you’ve kept'); }
+  const doc = `${ex.area} ${ex.descr}`.toLowerCase();
+  const hits = [];
+  for (const [w, wt] of taste.kw) { if (wt > 0 && doc.includes(w)) { score += wt * 3; hits.push(w); } else if (wt < 0 && doc.includes(w)) { score += wt * 2; } }
+  if (hits.length) why.push('mentions ' + hits.sort((x, y) => taste.kw.get(y) - taste.kw.get(x)).slice(0, 3).join(', '));
+  return { score, why: why.slice(0, 2) };
+}
+// Pull the embedded "properties":[…] array out of a Rightmove search page
+// (bracket-matched). One fetch per area gives every candidate's price/beds/etc.
+function grabArray(src, marker) {
+  const i = src.indexOf(marker); if (i < 0) return null;
+  let j = src.indexOf('[', i), depth = 0, inStr = false, esc = false;
+  for (let k = j; k < src.length; k++) {
+    const c = src[k];
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; }
+    else if (c === '"') inStr = true;
+    else if (c === '[') depth++;
+    else if (c === ']') { if (--depth === 0) { try { return JSON.parse(src.slice(j, k + 1)); } catch { return null; } } }
+  }
+  return null;
+}
+function parseSearchResults(html) {
+  const arr = grabArray(html, '"properties":[');
+  if (!Array.isArray(arr)) return [];
+  return arr.map(p => ({
+    id: String(p.id),
+    price: p.price && p.price.amount,
+    beds: p.bedrooms,
+    type: p.propertySubType || 'home',
+    addr: p.displayAddress || '',
+    summary: p.summary || '',
+    outcode: (String(p.displayAddress || '').match(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g) || []).slice(-1)[0] || null,
+  })).filter(p => p.id && p.price);
+}
+async function discover() {
+  const brief = { maxPrice: 550000, beds: [1, 2], areas: ['Islington', 'Hackney', 'Bow', 'Walthamstow', 'Stoke-Newington'] };
+  const taste = await buildTaste();
+  const existing = new Set((await db.execute('SELECT listing_url FROM properties')).rows
+    .map(r => (String(r.listing_url).match(/(\d{5,})/) || [])[1]).filter(Boolean));
+  const seen = new Set(), candidates = [];
+  for (const area of brief.areas.slice(0, 4)) {
+    try {
+      const html = await (await fetch(`https://www.rightmove.co.uk/property-for-sale/${area}/2-bed-flats.html`,
+        { headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' }, signal: AbortSignal.timeout(20000) })).text();
+      for (const c of parseSearchResults(html)) {
+        if (existing.has(c.id) || seen.has(c.id)) continue;
+        seen.add(c.id);
+        if (c.price > brief.maxPrice || c.price < 120000) continue;      // 120k floor drops shared-ownership teasers
+        if (c.beds && !brief.beds.includes(c.beds)) continue;
+        candidates.push(c);
+      }
+    } catch { }
+    await sleep(900);
+  }
+  const scored = candidates.map(c => {
+    const ex = { price: c.price, beds: c.beds, outcode: c.outcode, area: c.addr, descr: `${c.summary} ${c.type}` };
+    const s = scoreCandidate(ex, taste, brief);
+    return { id: c.id, url: `https://www.rightmove.co.uk/properties/${c.id}`, score: s.score, why: s.why };
+  }).sort((a, b) => b.score - a.score);
+  const added = [];
+  for (const t of scored.slice(0, 4)) {
+    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief') }).catch(() => null);
+    if (r && r.ok && !r.existing) added.push({ name: r.name, why: t.why });
+    await sleep(600);
+  }
+  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count };
 }
 
 // Database selection:
@@ -271,6 +374,10 @@ createServer(async (req, res) => {
   if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(url.searchParams.get('person') || '')));
   if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(), 'text/csv; charset=utf-8');
   if (url.pathname === '/api/refresh' && req.method === 'POST') return send(res, 200, JSON.stringify(await refresh()));
+  if (url.pathname === '/api/discover' && req.method === 'POST') {
+    try { return send(res, 200, JSON.stringify(await discover())); }
+    catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Search did not complete (Rightmove may be rate-limiting). Try again shortly.' })); }
+  }
   if (url.pathname === '/api/properties' && req.method === 'POST') {
     let body = ''; for await (const chunk of req) body += chunk;
     try {

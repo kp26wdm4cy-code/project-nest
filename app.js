@@ -177,7 +177,7 @@ function renderList() {
     const av = availInfo(p);
     return `<button class="property-item ${p.id === selectedId ? 'active' : ''} ${p.recommendation === 'View' ? 'top' : ''}" data-id="${p.id}">
       <div class="item-top"><strong>${p.name}</strong><span class="fit">${p.recommendation === 'View' ? 'VIEW FIRST' : 'WATCH'}</span></div>
-      <span>${p.area} · ${money(p.price)} · ${p.bedrooms} bed <i class="avail ${av.cls}">${av.text}</i></span>
+      <span>${p.area} · ${money(p.price)} · ${p.bedrooms} bed <i class="avail ${av.cls}">${av.text}</i>${(p.tags || []).includes('suggested') ? '<i class="sug">✨ Suggested</i>' : ''}</span>
       <span><i class="status-dot ${markerClass(p)}"></i>${label(statusOf(p))}${pv ? ` · <b class="partner">${partner()}: ${verdictText(pv.verdict)}</b>` : ''}</span>
     </button>`;
   }).join('') : '<p class="empty">Nothing here yet. Switch contributor or tab — verdicts are saved on the shared server.</p>';
@@ -341,6 +341,30 @@ async function submitAddUrl(btn) {
   finally { btn.disabled = false; input.disabled = false; btn.textContent = orig; }
 }
 
+async function submitDiscover(btn) {
+  const status = document.getElementById('addStatus');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Searching Rightmove…';
+  status.classList.remove('err');
+  status.textContent = 'Reading listings across your brief areas and ranking them by what you and Hannah have liked — this can take up to a minute…';
+  try {
+    const res = await fetch('/api/discover', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { status.classList.add('err'); status.textContent = data.error; }
+    else if (!data.added || !data.added.length) {
+      status.textContent = `Looked at ${data.considered || 0} listings across your areas — nothing new beat what you already have. Try again in a day or two as fresh homes come on.`;
+    } else {
+      status.textContent = `Added ${data.added.length} suggestion${data.added.length > 1 ? 's' : ''}: ${data.added.map(a => '“' + a.name + '”').join(', ')} — look for the ✨ Suggested tag, and each explains why.`;
+      ui.filter = 'queue'; saveUi();
+      await loadProperties();
+      document.querySelector('.tab.active')?.classList.remove('active');
+      document.querySelector('.tab[data-filter="queue"]')?.classList.add('active');
+      renderAll();
+    }
+  } catch { status.classList.add('err'); status.textContent = 'The search could not complete — Rightmove may be rate-limiting. Try again shortly.'; }
+  finally { btn.disabled = false; btn.textContent = orig; }
+}
+
 // Two-click remove (no blocking browser dialog).
 function removeProperty(p) {
   const btn = document.getElementById('removeHome');
@@ -374,6 +398,8 @@ function bind() {
     addBtn.onclick = () => submitAddUrl(addBtn);
     document.getElementById('addUrl').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitAddUrl(addBtn); } });
   }
+  const discoverBtn = document.getElementById('discoverBtn');
+  if (discoverBtn) discoverBtn.onclick = () => submitDiscover(discoverBtn);
   renderPersonSwitch();
 }
 
