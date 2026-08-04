@@ -29,17 +29,26 @@
   <main id="top">
     <section class="intro">
       <div>
-        <p class="kicker">TODAY'S CURATED SHORTLIST</p>
-        <h1>Only homes I think<br>you should <em>actually see.</em></h1>
-        <p class="subhead">Start with the map. Open the listing for the pictures and floor plan. Then tell Nest your instinct — it will remember the reason.</p>
+        <p class="kicker">YOUR SHARED SHORTLIST</p>
+        <h1>Only homes you<br>should <em>actually see.</em></h1>
+        <p class="subhead">Paste a Rightmove, Zoopla or OnTheMarket link to add a home — its photos, floor plan and area data fill in automatically. Then you both react, and Nest remembers why.</p>
       </div>
       <div class="inbox-note">
         <p id="leadStatus"><span class="live"></span><strong>Loading leads…</strong></p>
         <div class="lead-actions">
-          <button type="button" id="checkListings" class="lead-btn">↻ Check listings now</button>
+          <button type="button" id="checkListings" class="lead-btn ghost">↻ Re-check saved homes</button>
           <a id="exportTracker" class="lead-btn ghost" href="/api/export.csv" download="nest-tracker.csv">↓ Export tracker (CSV)</a>
         </div>
       </div>
+    </section>
+
+    <section class="add-bar" aria-label="Add a listing">
+      <div class="add-row">
+        <span class="add-plus">＋</span>
+        <input id="addUrl" type="url" inputmode="url" placeholder="Paste a Rightmove, Zoopla or OnTheMarket link to add a home…" autocomplete="off" />
+        <button type="button" id="addBtn" class="lead-btn">Add home</button>
+      </div>
+      <p id="addStatus" class="add-status">Adds the home for both of you, and pulls in its photos, floor plan and area intelligence.</p>
     </section>
 
     <section class="workspace" aria-label="Curated property workspace">

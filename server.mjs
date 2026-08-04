@@ -34,6 +34,86 @@ async function storeMedia(id, media) {
   });
 }
 
+// --- add-a-listing: extract a property from a pasted portal URL -----------
+const PORTALS = /(?:^|\.)(?:rightmove\.co\.uk|zoopla\.co\.uk|onthemarket\.com|primelocation\.com)$/i;
+const slug = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+function decodeEntities(s) {
+  return String(s).replace(/&amp;/g, '&').replace(/&pound;/g, '£').replace(/&#39;|&apos;/g, "'")
+    .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
+}
+function ogMeta(html, k) {
+  const m = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']og:${k}["'][^>]+content=["']([^"']*)["']`, 'i'))
+    || html.match(new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["']og:${k}["']`, 'i'));
+  return m ? decodeEntities(m[1]) : null;
+}
+async function geocode(postcode, outcode) {
+  try { if (postcode) { const g = await getJsonQuick(`https://api.postcodes.io/postcodes/${encodeURIComponent(postcode)}`); if (g.result) return { lat: g.result.latitude, lng: g.result.longitude, district: g.result.admin_district }; } } catch { }
+  try { if (outcode) { const g = await getJsonQuick(`https://api.postcodes.io/outcodes/${encodeURIComponent(outcode)}`); if (g.result) return { lat: g.result.latitude, lng: g.result.longitude, district: (g.result.admin_district || [])[0] }; } } catch { }
+  return null;
+}
+async function getJsonQuick(u) { const r = await fetch(u, { signal: AbortSignal.timeout(10000) }); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }
+function extractListing(html, href) {
+  const title = ogMeta(html, 'title') || '';
+  const descr = ogMeta(html, 'description') || '';
+  const image = ogMeta(html, 'image');
+  const text = `${descr} ${title}`;
+  const beds = +((text.match(/(\d+)\s*bed/i) || [])[1] || 0) || null;
+  const type = (text.match(/bedroom\s+([a-z][a-z-]*)\b/i) || [])[1] || (text.match(/\b(flat|maisonette|apartment|house|studio|bungalow|cottage|duplex)\b/i) || [])[1] || 'home';
+  let price = null;
+  const pm = html.match(/primaryPrice"[^>]*><span>£([\d,]+)/) || descr.match(/£\s?([\d,]{4,})/) || html.match(/£\s?([\d,]{4,})/);
+  if (pm) price = +pm[1].replace(/,/g, '');
+  let area = (descr.match(/\bin\s+(.+?)\s+for\s+£/i) || [])[1] || (title.match(/\bin\s+(.+?)(?:\s+for|$)/i) || [])[1] || '';
+  area = area.replace(/,?\s*United Kingdom\s*$/i, '').replace(/\s+/g, ' ').trim();
+  // Read location ONLY from the listing's own description (the page HTML is full
+  // of postcode-shaped junk like CSS hashes). Full postcode if present, else the
+  // outward code (e.g. "E1W") — the last postcode-shaped token in the area text.
+  const pcD = descr.match(/\b([A-Z]{1,2}\d[A-Z\d]?)\s+(\d[A-Z]{2})\b/);
+  const postcode = pcD ? `${pcD[1]} ${pcD[2]}` : null;
+  const outcodes = [...area.matchAll(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g)].map(m => m[1]);
+  const outcode = outcodes[outcodes.length - 1] || null;
+  const media = extractMedia(html, href);
+  if (!media.photos.length && image) media.photos = [image];
+  return { title, descr, beds, type, price, area, postcode, outcode, media };
+}
+async function addListing(listingUrl) {
+  const u = new URL(listingUrl);
+  if (!PORTALS.test(u.hostname)) return { error: 'Please paste a Rightmove, Zoopla, OnTheMarket or PrimeLocation link.' };
+  let resp;
+  try { resp = await fetch(u.href, { redirect: 'follow', headers: { 'User-Agent': BROWSER_UA, 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' }, signal: AbortSignal.timeout(20000) }); }
+  catch { return { error: 'Could not reach that page.' }; }
+  if (!resp.ok) return { error: `That page returned ${resp.status}.` + (/zoopla/i.test(u.hostname) ? ' Zoopla often blocks automated reads — a Rightmove link is most reliable.' : '') };
+  const html = await resp.text();
+  const ex = extractListing(html, u.href);
+  const geo = await geocode(ex.postcode, ex.outcode);
+  if (!geo) return { error: 'Could not work out the location from that page. A Rightmove link works best.' };
+  if (!ex.price) return { error: 'Could not read the price from that page.' };
+  const rmId = (u.href.match(/(\d{5,})/) || [])[1];
+  const prefix = /rightmove/i.test(u.hostname) ? 'rm-' : /zoopla/i.test(u.hostname) ? 'zp-' : /onthemarket/i.test(u.hostname) ? 'otm-' : 'pl-';
+  const id = prefix + (rmId || slug(ex.area).slice(0, 24) || Math.abs([...u.href].reduce((a, c) => a * 31 + c.charCodeAt(0) | 0, 7)).toString(36));
+  const exists = (await db.execute({ sql: 'SELECT id FROM properties WHERE id=?', args: [id] })).rows[0];
+  const street = (ex.area.split(',')[0] || ex.area || 'Home').trim();
+  const name = `${ex.beds ? ex.beds + ' bed ' : ''}${ex.type}, ${street}`.trim();
+  const areaLabel = (ex.area || [geo.district, ex.outcode].filter(Boolean).join(', ') || 'Location').slice(0, 80);
+  if (!exists) {
+    await db.execute({
+      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      args: [id, name, areaLabel, ex.price, ex.beds || 0, 'Size TBC', geo.lat, geo.lng, u.href, 'View', 'Medium',
+        (ex.descr ? ex.descr.replace(/\s+/g, ' ').trim() : 'Added from a listing link.'),
+        'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.',
+        [ex.type, ex.outcode].filter(Boolean).join('|'), new Date().toISOString()],
+    });
+    if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
+    (async () => {
+      try {
+        const data = await computeInsights({ latitude: geo.lat, longitude: geo.lng, price: ex.price, area: areaLabel }, { tflKey });
+        await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), data.computedAt] });
+      } catch { }
+    })();
+  }
+  return { ok: true, id, name, existing: !!exists };
+}
+
 // Database selection:
 //  - In production, set TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN) and data lives
 //    in Turso's cloud, so it survives redeploys on hosts with no persistent disk.
@@ -166,8 +246,8 @@ async function refresh() {
       results.push({ id: item.id, status: 'needs-check' });
     }
   }
-  const insights = await refreshInsights().catch(() => []);
-  return { availability: results, insights };
+  refreshInsights().catch(() => {}); // recompute area data in the background so the button returns quickly
+  return { availability: results };
 }
 
 function staticFile(pathname) {
@@ -184,6 +264,22 @@ createServer(async (req, res) => {
   if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(url.searchParams.get('person') || '')));
   if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(), 'text/csv; charset=utf-8');
   if (url.pathname === '/api/refresh' && req.method === 'POST') return send(res, 200, JSON.stringify(await refresh()));
+  if (url.pathname === '/api/properties' && req.method === 'POST') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    try {
+      const { url: listingUrl } = JSON.parse(body || '{}');
+      if (!listingUrl) return send(res, 400, JSON.stringify({ error: 'No link provided.' }));
+      const result = await addListing(listingUrl);
+      return send(res, result.error ? 422 : 200, JSON.stringify(result));
+    } catch (e) { return send(res, 400, JSON.stringify({ error: 'Could not add that link.' })); }
+  }
+  const del = url.pathname.match(/^\/api\/properties\/([^/]+)$/);
+  if (del && req.method === 'DELETE') {
+    const id = del[1];
+    for (const t of ['feedback', 'insights', 'media']) await db.execute({ sql: `DELETE FROM ${t} WHERE property_id=?`, args: [id] });
+    await db.execute({ sql: 'DELETE FROM properties WHERE id=?', args: [id] });
+    return send(res, 200, JSON.stringify({ ok: true }));
+  }
   const match = url.pathname.match(/^\/api\/properties\/([^/]+)\/feedback$/);
   if (match && req.method === 'PUT') {
     let body = '';

@@ -210,12 +210,13 @@ function renderDetail() {
   const pv = partnerVerdict(p);
   const av = availInfo(p);
   const med = p.media || {};
-  const shots = [...(med.photos || []), ...(med.floorplans || [])];
+  const floors = med.floorplans || [], pics = med.photos || [];
+  const shots = [...floors, ...pics];              // floor plan first, then photos
+  const isFloor = u => floors.includes(u);
   const gallery = shots.length ? `<div class="gallery">
-      <img id="galMain" class="gallery-main" src="${shots[0]}" referrerpolicy="no-referrer" alt="Listing photo of ${p.name}">
+      <img id="galMain" class="gallery-main" src="${shots[0]}" referrerpolicy="no-referrer" alt="${p.name}">
       <div class="gallery-strip">
-        ${(med.photos || []).map((u, i) => `<button class="thumb${i === 0 ? ' active' : ''}" data-src="${u}"><img src="${u}" referrerpolicy="no-referrer" alt="" loading="lazy"></button>`).join('')}
-        ${(med.floorplans || []).map(u => `<button class="thumb floor" data-src="${u}" title="Floorplan"><img src="${u}" referrerpolicy="no-referrer" alt="Floorplan" loading="lazy"><span>PLAN</span></button>`).join('')}
+        ${shots.map((u, i) => `<button class="thumb${isFloor(u) ? ' floor' : ''}${i === 0 ? ' active' : ''}" data-src="${u}"${isFloor(u) ? ' title="Floorplan"' : ''}><img src="${u}" referrerpolicy="no-referrer" alt="${isFloor(u) ? 'Floorplan' : ''}" loading="lazy">${isFloor(u) ? '<span>PLAN</span>' : ''}</button>`).join('')}
       </div>
     </div>` : '';
   box.innerHTML = `${gallery}<div>
@@ -224,7 +225,10 @@ function renderDetail() {
         <p class="kicker">NEST'S VIEW · ${p.confidence.toUpperCase()} CONFIDENCE</p>
         <h2>${p.name}<br><em>${p.recommendation === 'View' ? 'Worth seeing first.' : 'Worth a closer look.'}</em></h2>
       </div>
-      <a class="listing-button" href="${p.listing_url}" target="_blank" rel="noreferrer">Open full listing ↗</a>
+      <div class="heading-actions">
+        <a class="listing-button" href="${p.listing_url}" target="_blank" rel="noreferrer">Open full listing ↗</a>
+        <button type="button" id="removeHome" class="remove-home">Remove home</button>
+      </div>
     </div>
     <p class="facts">${p.area} · ${money(p.price)} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}
       <span class="avail ${av.cls} big">${av.text}</span><span class="checked">${whenChecked(p.last_checked)}</span></p>
@@ -245,6 +249,7 @@ function renderDetail() {
     t.classList.add('active');
   });
   box.querySelectorAll('[data-verdict]').forEach(b => b.onclick = () => onVerdict(p, b.dataset.verdict));
+  document.getElementById('removeHome')?.addEventListener('click', () => removeProperty(p));
   document.getElementById('note').addEventListener('change', async e => {
     try { await saveFeedback(p, { note: e.target.value }); document.getElementById('savedNote').textContent = 'Note saved on the shared server.'; renderLearning(); }
     catch { document.getElementById('savedNote').textContent = 'Could not save — is the server running?'; }
@@ -309,6 +314,47 @@ async function checkListings(btn) {
   }
 }
 
+async function submitAddUrl(btn) {
+  const input = document.getElementById('addUrl');
+  const status = document.getElementById('addStatus');
+  const val = (input.value || '').trim();
+  if (!val) { input.focus(); return; }
+  const orig = btn.textContent;
+  btn.disabled = true; input.disabled = true; btn.textContent = 'Reading…';
+  status.classList.remove('err'); status.textContent = 'Fetching the listing, its photos and area intelligence…';
+  try {
+    const res = await fetch('/api/properties', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: val }) });
+    const data = await res.json();
+    if (!res.ok || data.error) { status.classList.add('err'); status.textContent = data.error || 'Could not add that link.'; }
+    else {
+      input.value = '';
+      status.textContent = data.existing ? `“${data.name}” is already on your list.` : `Added “${data.name}”. Photos are in; area data is filling in — press it again in a moment if the panel is still loading.`;
+      selectedId = data.id;
+      ui.filter = 'queue'; saveUi();
+      await loadProperties();
+      document.querySelector('.tab.active')?.classList.remove('active');
+      document.querySelector('.tab[data-filter="queue"]')?.classList.add('active');
+      renderAll();
+      document.getElementById('propertyDetail')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  } catch { status.classList.add('err'); status.textContent = 'Something went wrong adding that link.'; }
+  finally { btn.disabled = false; input.disabled = false; btn.textContent = orig; }
+}
+
+// Two-click remove (no blocking browser dialog).
+function removeProperty(p) {
+  const btn = document.getElementById('removeHome');
+  if (!btn) return;
+  if (btn.dataset.armed !== '1') {
+    btn.dataset.armed = '1'; btn.textContent = 'Click again to remove'; btn.classList.add('armed');
+    setTimeout(() => { const b = document.getElementById('removeHome'); if (b) { b.dataset.armed = ''; b.textContent = 'Remove home'; b.classList.remove('armed'); } }, 3000);
+    return;
+  }
+  fetch(`/api/properties/${encodeURIComponent(p.id)}`, { method: 'DELETE' })
+    .then(async () => { selectedId = null; await loadProperties(); renderAll(); })
+    .catch(() => {});
+}
+
 function renderAll() {
   renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderLeadNote();
 }
@@ -323,6 +369,11 @@ function bind() {
   document.getElementById('briefButton').onclick = () => document.getElementById('brief').scrollIntoView({ behavior: 'smooth' });
   document.querySelectorAll('#personSwitch button').forEach(b => b.onclick = () => switchPerson(b.dataset.person));
   document.getElementById('checkListings').onclick = e => checkListings(e.currentTarget);
+  const addBtn = document.getElementById('addBtn');
+  if (addBtn) {
+    addBtn.onclick = () => submitAddUrl(addBtn);
+    document.getElementById('addUrl').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitAddUrl(addBtn); } });
+  }
   renderPersonSwitch();
 }
 
