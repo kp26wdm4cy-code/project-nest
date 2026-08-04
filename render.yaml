@@ -1,0 +1,17 @@
+# Render Blueprint — tells Render how to run Nest.
+# When you connect this repo, Render reads this file automatically.
+services:
+  - type: web
+    name: project-nest
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.11.0
+      # The two Turso secrets below are set in the Render dashboard, not here.
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
