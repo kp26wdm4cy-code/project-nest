@@ -21,7 +21,9 @@ const statusOf = p => p.mine?.verdict || 'queue';
 const partnerVerdict = p => (p.feedback || []).find(f => f.person === partner() && f.verdict) || null;
 const label = status => ({ queue: 'To review', Love: 'Keeper', View: 'Worth viewing', Watch: 'Watch', Pass: 'Passed' })[status] || status;
 const verdictText = v => ({ Love: '♥ Love it', View: '✓ Would view', Watch: '◌ Watch', Pass: '× Forget it' })[v] || v;
-const markerClass = p => { const s = statusOf(p); return s === 'Pass' ? 'passed' : (s === 'Love' || s === 'View' || s === 'Watch') ? 'kept' : 'unreviewed'; };
+// Map pins + list dots are coloured by verdict: love=vivid green, view=light green,
+// watch=faint yellow, forget=grey, not-yet-reviewed=neutral.
+const markerClass = p => ({ Love: 'v-love', View: 'v-view', Watch: 'v-watch', Pass: 'v-pass' })[statusOf(p)] || 'v-queue';
 
 const AVAIL = {
   available: { text: 'Available', cls: 'ok' },
