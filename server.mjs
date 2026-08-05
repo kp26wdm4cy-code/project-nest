@@ -312,19 +312,27 @@ const getDestinations = () => getSetting('destinations', []);
 // --- commute times (TfL Journey Planner) ----------------------------------
 async function computeCommutes(property, destinations) {
   const out = [];
-  const key = process.env.TFL_APP_KEY ? `?app_key=${encodeURIComponent(process.env.TFL_APP_KEY)}` : '';
+  const auth = process.env.TFL_APP_KEY ? `app_key=${encodeURIComponent(process.env.TFL_APP_KEY)}` : '';
   const from = `${property.latitude},${property.longitude}`;
+  // Fetch the shortest journey for a given TfL mode filter (empty = public transport).
+  const fastest = async (postcode, extra) => {
+    const qs = [auth, extra].filter(Boolean).join('&');
+    const url = `https://api.tfl.gov.uk/Journey/JourneyResults/${encodeURIComponent(from)}/to/${encodeURIComponent(postcode)}${qs ? `?${qs}` : ''}`;
+    const r = await fetch(url, { headers: { 'User-Agent': 'Project-Nest/1.0' }, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return null;
+    const journeys = (await r.json()).journeys || [];
+    if (!journeys.length) return null;
+    return journeys.reduce((a, b) => (a.duration <= b.duration ? a : b));
+  };
   for (const d of destinations) {
     try {
-      const url = `https://api.tfl.gov.uk/Journey/JourneyResults/${encodeURIComponent(from)}/to/${encodeURIComponent(d.postcode)}${key}`;
-      const r = await fetch(url, { headers: { 'User-Agent': 'Project-Nest/1.0' }, signal: AbortSignal.timeout(15000) });
-      if (!r.ok) { out.push({ name: d.name, postcode: d.postcode, minutes: null }); continue; }
-      const journeys = (await r.json()).journeys || [];
-      if (!journeys.length) { out.push({ name: d.name, postcode: d.postcode, minutes: null }); continue; }
-      const best = journeys.reduce((a, b) => (a.duration <= b.duration ? a : b));
-      const modes = [...new Set((best.legs || []).map(l => l.mode && l.mode.name).filter(m => m && m !== 'walking'))];
-      out.push({ name: d.name, postcode: d.postcode, minutes: best.duration, modes });
-    } catch { out.push({ name: d.name, postcode: d.postcode, minutes: null }); }
+      const transit = await fastest(d.postcode, '');
+      let cycle = null;
+      try { cycle = await fastest(d.postcode, 'mode=cycle'); } catch { }
+      if (!transit && !cycle) { out.push({ name: d.name, postcode: d.postcode, minutes: null, cycleMinutes: null }); continue; }
+      const modes = transit ? [...new Set((transit.legs || []).map(l => l.mode && l.mode.name).filter(m => m && m !== 'walking'))] : [];
+      out.push({ name: d.name, postcode: d.postcode, minutes: transit ? transit.duration : null, cycleMinutes: cycle ? cycle.duration : null, modes });
+    } catch { out.push({ name: d.name, postcode: d.postcode, minutes: null, cycleMinutes: null }); }
     await new Promise(r => setTimeout(r, 300));
   }
   return out;

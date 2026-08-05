@@ -341,7 +341,7 @@ function renderDetail() {
       <span class="avail ${av.cls} big">${av.text}</span><span class="checked">${whenChecked(p.last_checked)}</span></p>
     <p class="agent-view">${p.agent_view}</p>
     <div class="questions"><strong>Before you book it</strong>${p.checks}</div>
-    ${(p.commutes && p.commutes.length) ? `<div class="commutes"><strong>Getting to your places</strong>${p.commutes.map(c => `<div class="commute-row"><span class="cm-name">${c.name}</span><b class="cm-min">${c.minutes != null ? c.minutes + ' min' : '—'}</b><span class="cm-mode">${c.minutes != null ? (c.modes && c.modes.length ? c.modes.join(' · ') : 'walk') : 'no route'}</span></div>`).join('')}</div>` : ''}
+    ${(p.commutes && p.commutes.length) ? `<div class="commutes"><strong>Getting to your places</strong>${p.commutes.map(c => `<div class="commute-row"><span class="cm-name">${c.name}</span><span class="cm-leg"><span class="cm-ico">🚉</span><b class="cm-min">${c.minutes != null ? c.minutes + ' min' : '—'}</b><span class="cm-mode">${c.minutes != null ? (c.modes && c.modes.length ? c.modes.join(' · ') : 'walk') : 'no transit route'}</span></span><span class="cm-leg cm-cycle"><span class="cm-ico">🚲</span><b class="cm-min">${c.cycleMinutes != null ? c.cycleMinutes + ' min' : '—'}</b><span class="cm-mode">${c.cycleMinutes != null ? 'cycle' : 'no cycle route'}</span></span></div>`).join('')}</div>` : ''}
   </div>
   <div class="reaction">
     <p class="kicker">SHARED VERDICT · YOU ARE ${ui.person.toUpperCase()}</p>
