@@ -89,6 +89,14 @@
     </section>
   </main>
 
+  <div id="lightbox" class="lightbox" hidden>
+    <button class="lb-close" aria-label="Close">×</button>
+    <button class="lb-nav lb-prev" aria-label="Previous">‹</button>
+    <img id="lbImg" src="" alt="Listing image" referrerpolicy="no-referrer" />
+    <button class="lb-nav lb-next" aria-label="Next">›</button>
+    <span id="lbCount" class="lb-count"></span>
+  </div>
+
   <footer>Nest is your shared memory for the search — not another feed of listings.</footer>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="app.js"></script>

@@ -10,6 +10,7 @@ const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 let properties = [];      // latest server snapshot, for the current person
 let selectedId = null;
 let map, markers = {};
+let galShots = [], galIndex = 0;  // current gallery images for the full-screen viewer
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
 const byId = id => properties.find(p => p.id === id);
@@ -243,11 +244,14 @@ function renderDetail() {
     <textarea id="note" placeholder="What works or puts you off? e.g. 'living room feels dark'">${mine.note || ''}</textarea>
     <div class="saved-note" id="savedNote">${mine.verdict || mine.note ? 'Saved on the shared server.' : ''}</div>
   </div>`;
-  box.querySelectorAll('.thumb').forEach(t => t.onclick = () => {
+  galShots = shots; galIndex = 0;
+  box.querySelectorAll('.thumb').forEach((t, i) => t.onclick = () => {
+    galIndex = i;
     document.getElementById('galMain').src = t.dataset.src;
     box.querySelectorAll('.thumb').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
   });
+  document.getElementById('galMain')?.addEventListener('click', () => openLightbox(galIndex));
   box.querySelectorAll('[data-verdict]').forEach(b => b.onclick = () => onVerdict(p, b.dataset.verdict));
   document.getElementById('removeHome')?.addEventListener('click', () => removeProperty(p));
   document.getElementById('note').addEventListener('change', async e => {
@@ -265,6 +269,18 @@ async function onVerdict(p, verdict) {
     const s = document.getElementById('savedNote'); if (s) s.textContent = 'Could not save — is the server running?';
   }
 }
+
+// ---- full-screen image viewer -------------------------------------------
+function openLightbox(i) {
+  if (!galShots.length) return;
+  galIndex = (i % galShots.length + galShots.length) % galShots.length;
+  document.getElementById('lbImg').src = galShots[galIndex];
+  document.getElementById('lbCount').textContent = `${galIndex + 1} / ${galShots.length}`;
+  document.getElementById('lightbox').hidden = false;
+  document.body.classList.add('lb-open');
+}
+function lbStep(d) { openLightbox(galIndex + d); }
+function closeLightbox() { document.getElementById('lightbox').hidden = true; document.body.classList.remove('lb-open'); }
 
 function renderLearning() {
   const mine = properties.map(p => p.mine).filter(Boolean);
@@ -400,6 +416,19 @@ function bind() {
   }
   const discoverBtn = document.getElementById('discoverBtn');
   if (discoverBtn) discoverBtn.onclick = () => submitDiscover(discoverBtn);
+  const lb = document.getElementById('lightbox');
+  if (lb) {
+    lb.querySelector('.lb-close').onclick = closeLightbox;
+    lb.querySelector('.lb-prev').onclick = e => { e.stopPropagation(); lbStep(-1); };
+    lb.querySelector('.lb-next').onclick = e => { e.stopPropagation(); lbStep(1); };
+    lb.addEventListener('click', e => { if (e.target === lb) closeLightbox(); });
+    document.addEventListener('keydown', e => {
+      if (lb.hidden) return;
+      if (e.key === 'Escape') closeLightbox();
+      else if (e.key === 'ArrowLeft') lbStep(-1);
+      else if (e.key === 'ArrowRight') lbStep(1);
+    });
+  }
   renderPersonSwitch();
 }
 

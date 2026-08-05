@@ -22,8 +22,23 @@ function extractMedia(html, listingUrl) {
   if (!id) return { photos: [], floorplans: [], fetchedAt: new Date().toISOString() };
   const all = [...new Set((html.match(/https:\/\/media\.(?:rightmove\.co\.uk|onthemarket\.com)\/[^"'\\ )]+\.(?:jpe?g|png)/gi) || []))]
     .filter(u => u.includes('/' + id + '/'));
-  const floorplans = all.filter(u => /property-floorplan|_FLP_|floorplan/i.test(u)).slice(0, 3);
-  const photos = all.filter(u => !/property-floorplan|_FLP_|floorplan|_max_/i.test(u)).slice(0, 24);
+  const isFloor = u => /property-floorplan|_FLP_|floorplan/i.test(u);
+  // The same image often appears at several sizes (a tiny "_max_296x197" thumbnail
+  // AND a full-res version). Group by the image's hash and keep the largest — the
+  // unsized full-res URL beats any sized thumbnail.
+  const dedupe = urls => {
+    const groups = new Map();
+    for (const u of urls) {
+      const hash = (u.match(/([a-f0-9]{20,})/) || [u])[0];
+      const sized = u.match(/(?:_max_|[-_])(\d{2,4})x\d{2,4}\.(?:png|jpe?g)/i);
+      const rank = sized ? +sized[1] : 100000;   // full-res (no size suffix) wins
+      const prev = groups.get(hash);
+      if (!prev || rank > prev.rank) groups.set(hash, { u, rank });
+    }
+    return [...groups.values()].map(x => x.u);
+  };
+  const floorplans = dedupe(all.filter(isFloor)).slice(0, 4);
+  const photos = dedupe(all.filter(u => !isFloor(u))).slice(0, 30);
   return { photos, floorplans, fetchedAt: new Date().toISOString() };
 }
 async function storeMedia(id, media) {
