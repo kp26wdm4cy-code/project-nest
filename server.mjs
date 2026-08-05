@@ -122,11 +122,11 @@ async function addListing(listingUrl, opts = {}) {
   const tags = [ex.type, ex.outcode, opts.reason ? 'suggested' : null].filter(Boolean).join('|');
   if (!exists) {
     await db.execute({
-      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       args: [id, name, areaLabel, ex.price, ex.beds || 0, 'Size TBC', lat, lng, u.href, 'View', 'Medium', agentView,
         'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.',
-        tags, new Date().toISOString()],
+        tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null],
     });
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
     (async () => {
@@ -205,15 +205,34 @@ function parseSearchResults(html) {
     outcode: (String(p.displayAddress || '').match(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g) || []).slice(-1)[0] || null,
   })).filter(p => p.id && p.price);
 }
-async function discover() {
-  const brief = { maxPrice: 550000, beds: [1, 2], areas: ['Islington', 'Hackney', 'Bow', 'Walthamstow', 'Stoke-Newington'] };
+async function getSearchDistricts() {
+  const d = await getSetting('search_districts', null);
+  return (Array.isArray(d) && d.length) ? d : DEFAULT_DISTRICTS;
+}
+// Keep at most `cap` UNTOUCHED suggestions (auto-added, no verdict yet). Anything
+// the couple has reacted to, added by hand, or seeded is never touched.
+async function capSuggestions(cap) {
+  const rows = (await db.execute(`SELECT id FROM properties
+    WHERE tags LIKE '%suggested%' AND id NOT IN (SELECT property_id FROM feedback)
+    ORDER BY COALESCE(suggest_score,0) DESC`)).rows;
+  const doomed = rows.slice(cap).map(r => r.id);
+  for (const id of doomed) {
+    for (const t of ['feedback', 'insights', 'media']) await db.execute({ sql: `DELETE FROM ${t} WHERE property_id=?`, args: [id] });
+    await db.execute({ sql: 'DELETE FROM properties WHERE id=?', args: [id] });
+  }
+  return doomed.length;
+}
+async function discover(opts = {}) {
+  const max = opts.max || 4;            // how many new homes to add this run
+  const brief = { maxPrice: 550000, beds: [1, 2] };
   const taste = await buildTaste();
+  const areas = (await getSearchDistricts()).slice(0, opts.maxAreas || 5);
   const existing = new Set((await db.execute('SELECT listing_url FROM properties')).rows
     .map(r => (String(r.listing_url).match(/(\d{5,})/) || [])[1]).filter(Boolean));
   const seen = new Set(), candidates = [];
-  for (const area of brief.areas.slice(0, 4)) {
+  for (const area of areas) {
     try {
-      const html = await (await fetch(`https://www.rightmove.co.uk/property-for-sale/${area}/2-bed-flats.html`,
+      const html = await (await fetch(`https://www.rightmove.co.uk/property-for-sale/${encodeURIComponent(area)}.html`,
         { headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' }, signal: AbortSignal.timeout(20000) })).text();
       for (const c of parseSearchResults(html)) {
         if (existing.has(c.id) || seen.has(c.id)) continue;
@@ -231,12 +250,13 @@ async function discover() {
     return { id: c.id, url: `https://www.rightmove.co.uk/properties/${c.id}`, score: s.score, why: s.why };
   }).sort((a, b) => b.score - a.score);
   const added = [];
-  for (const t of scored.slice(0, 4)) {
-    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief') }).catch(() => null);
+  for (const t of scored.slice(0, max)) {
+    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief'), score: t.score }).catch(() => null);
     if (r && r.ok && !r.existing) added.push({ name: r.name, why: t.why });
     await sleep(600);
   }
-  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count };
+  if (opts.poolCap) await capSuggestions(opts.poolCap);
+  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas };
 }
 
 // Database selection:
@@ -268,10 +288,23 @@ async function initialise() {
   CREATE TABLE IF NOT EXISTS media (
     property_id TEXT PRIMARY KEY, data TEXT NOT NULL, fetched_at TEXT NOT NULL,
     FOREIGN KEY(property_id) REFERENCES properties(id)
-  );`);
+  );
+  CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+  // Columns added over time — guarded so re-running is harmless.
+  for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL']) {
+    try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
+  }
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
   if (!count) await seed();
 }
+async function getSetting(key, fallback) {
+  try { const r = (await db.execute({ sql: 'SELECT value FROM settings WHERE key=?', args: [key] })).rows[0]; return r ? JSON.parse(r.value) : fallback; }
+  catch { return fallback; }
+}
+async function setSetting(key, value) {
+  await db.execute({ sql: 'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', args: [key, JSON.stringify(value)] });
+}
+const DEFAULT_DISTRICTS = ['N1', 'E2', 'E9', 'E3', 'N16', 'N5', 'E8', 'E5']; // Hoxton, Victoria Park, Bow, Stoke Newington, Highbury…
 
 async function seed() {
   const created = new Date().toISOString();
@@ -353,7 +386,7 @@ async function exportCsv() {
 }
 
 async function refresh() {
-  const items = (await db.execute({ sql: 'SELECT id, listing_url FROM properties WHERE availability != ?', args: ['off-market'] })).rows;
+  const items = (await db.execute({ sql: 'SELECT id, listing_url, price FROM properties WHERE availability != ?', args: ['off-market'] })).rows;
   const now = new Date().toISOString();
   const results = [];
   for (const item of items) {
@@ -365,6 +398,15 @@ async function refresh() {
       await db.execute({ sql: 'UPDATE properties SET availability=?, last_checked=? WHERE id=?', args: [unavailable ? 'off-market' : 'available', now, item.id] });
       // Reuse the page we just downloaded to refresh the photo/floorplan gallery.
       try { const m = extractMedia(html, item.listing_url); if (m.photos.length || m.floorplans.length) await storeMedia(item.id, m); } catch { /* leave last-good media */ }
+      // Price-change tracking: record the previous price + when it changed.
+      try {
+        const ogp = `${ogMeta(html, 'title') || ''} ${ogMeta(html, 'description') || ''}`;
+        const pm = ogp.match(/£\s?([\d,]{4,})/) || html.match(/primaryPrice"[^>]*><span>£([\d,]+)/);
+        const now2 = pm ? +pm[1].replace(/,/g, '') : null;
+        if (now2 && Math.abs(now2 - item.price) >= 1000) {
+          await db.execute({ sql: 'UPDATE properties SET prev_price=?, price=?, price_changed_at=? WHERE id=?', args: [item.price, now2, now, item.id] });
+        }
+      } catch { }
       results.push({ id: item.id, status: unavailable ? 'off-market' : 'available' });
     } catch {
       await db.execute({ sql: 'UPDATE properties SET availability=?, last_checked=? WHERE id=?', args: ['needs-check', now, item.id] });
@@ -390,8 +432,18 @@ createServer(async (req, res) => {
   if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(), 'text/csv; charset=utf-8');
   if (url.pathname === '/api/refresh' && req.method === 'POST') return send(res, 200, JSON.stringify(await refresh()));
   if (url.pathname === '/api/discover' && req.method === 'POST') {
-    try { return send(res, 200, JSON.stringify(await discover())); }
+    const scheduled = url.searchParams.get('scheduled') === '1';
+    try { return send(res, 200, JSON.stringify(await discover(scheduled ? { max: 8, poolCap: 20, maxAreas: 8 } : {}))); }
     catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Search did not complete (Rightmove may be rate-limiting). Try again shortly.' })); }
+  }
+  if (url.pathname === '/api/settings' && req.method === 'GET') return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts() }));
+  if (url.pathname === '/api/settings' && req.method === 'PUT') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    try {
+      const { searchDistricts } = JSON.parse(body || '{}');
+      if (Array.isArray(searchDistricts)) await setSetting('search_districts', [...new Set(searchDistricts.filter(x => /^[A-Z]{1,2}\d[A-Z\d]?$/i.test(x)).map(x => x.toUpperCase()))].slice(0, 60));
+      return send(res, 200, JSON.stringify({ ok: true, searchDistricts: await getSearchDistricts() }));
+    } catch { return send(res, 400, JSON.stringify({ error: 'Invalid settings' })); }
   }
   if (url.pathname === '/api/properties' && req.method === 'POST') {
     let body = ''; for await (const chunk of req) body += chunk;

@@ -11,6 +11,7 @@ let properties = [];      // latest server snapshot, for the current person
 let selectedId = null;
 let map, markers = {};
 let galShots = [], galIndex = 0;  // current gallery images for the full-screen viewer
+let districtLayer = null, selectedDistricts = new Set(), areaMode = false, saveDistTimer;
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
 const byId = id => properties.find(p => p.id === id);
@@ -163,6 +164,52 @@ function refreshMarkers() {
   });
 }
 
+// ---- search-area districts (map boundaries) ------------------------------
+async function loadSettings() {
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); } catch { }
+  updateAreaToggle();
+}
+function districtStyle(name) {
+  const on = selectedDistricts.has(name);
+  return { color: on ? '#285b43' : '#9aa79c', weight: on ? 1.6 : 0.6, fillColor: '#285b43', fillOpacity: on ? 0.3 : 0.05 };
+}
+async function ensureDistricts() {
+  if (districtLayer) return districtLayer;
+  const geo = await (await fetch('/districts.geojson', { cache: 'force-cache' })).json();
+  districtLayer = L.geoJSON(geo, {
+    style: f => districtStyle(f.properties.name),
+    onEachFeature: (f, layer) => {
+      const name = f.properties.name;
+      layer.bindTooltip(name, { sticky: true, direction: 'top', className: 'dist-tip' });
+      layer.on('click', () => {
+        selectedDistricts.has(name) ? selectedDistricts.delete(name) : selectedDistricts.add(name);
+        layer.setStyle(districtStyle(name));
+        updateAreaToggle();
+        clearTimeout(saveDistTimer);
+        saveDistTimer = setTimeout(() => fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ searchDistricts: [...selectedDistricts] }) }).catch(() => {}), 700);
+      });
+    },
+  });
+  return districtLayer;
+}
+async function toggleAreas() {
+  areaMode = !areaMode;
+  const layer = await ensureDistricts();
+  if (areaMode) { layer.addTo(map); layer.setStyle(f => districtStyle(f.properties.name)); }
+  else map.removeLayer(layer);
+  updateAreaToggle();
+}
+function updateAreaToggle() {
+  const b = document.getElementById('areaToggle');
+  if (!b) return;
+  const n = selectedDistricts.size;
+  b.classList.toggle('active', areaMode);
+  b.innerHTML = areaMode ? `Done${n ? ' · <b>' + n + '</b> selected' : ' · tap districts'}` : `◧ Search areas${n ? ' · ' + n : ''}`;
+}
+function priceDrop(p) {
+  return (p.prev_price && p.price < p.prev_price) ? Math.round((p.prev_price - p.price) / 1000) : 0;
+}
+
 // ---- lists ---------------------------------------------------------------
 function included(p, filter) {
   const s = statusOf(p);
@@ -178,7 +225,7 @@ function renderList() {
     const av = availInfo(p);
     return `<button class="property-item ${p.id === selectedId ? 'active' : ''} ${p.recommendation === 'View' ? 'top' : ''}" data-id="${p.id}">
       <div class="item-top"><strong>${p.name}</strong><span class="fit">${p.recommendation === 'View' ? 'VIEW FIRST' : 'WATCH'}</span></div>
-      <span>${p.area} · ${money(p.price)} · ${p.bedrooms} bed <i class="avail ${av.cls}">${av.text}</i>${(p.tags || []).includes('suggested') ? '<i class="sug">✨ Suggested</i>' : ''}</span>
+      <span>${p.area} · ${money(p.price)}${priceDrop(p) ? ` <i class="drop">↓ £${priceDrop(p)}k</i>` : ''} · ${p.bedrooms} bed <i class="avail ${av.cls}">${av.text}</i>${(p.tags || []).includes('suggested') ? '<i class="sug">✨ Suggested</i>' : ''}</span>
       <span><i class="status-dot ${markerClass(p)}"></i>${label(statusOf(p))}${pv ? ` · <b class="partner">${partner()}: ${verdictText(pv.verdict)}</b>` : ''}</span>
     </button>`;
   }).join('') : '<p class="empty">Nothing here yet. Switch contributor or tab — verdicts are saved on the shared server.</p>';
@@ -231,7 +278,7 @@ function renderDetail() {
         <button type="button" id="removeHome" class="remove-home">Remove home</button>
       </div>
     </div>
-    <p class="facts">${p.area} · ${money(p.price)} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}
+    <p class="facts">${p.area} · ${money(p.price)}${priceDrop(p) ? ` <span class="drop big">↓ £${priceDrop(p)}k from ${money(p.prev_price)}</span>` : ''} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}
       <span class="avail ${av.cls} big">${av.text}</span><span class="checked">${whenChecked(p.last_checked)}</span></p>
     <p class="agent-view">${p.agent_view}</p>
     <div class="questions"><strong>Before you book it</strong>${p.checks}</div>
@@ -416,6 +463,7 @@ function bind() {
   }
   const discoverBtn = document.getElementById('discoverBtn');
   if (discoverBtn) discoverBtn.onclick = () => submitDiscover(discoverBtn);
+  document.getElementById('areaToggle')?.addEventListener('click', toggleAreas);
   const lb = document.getElementById('lightbox');
   if (lb) {
     lb.querySelector('.lb-close').onclick = closeLightbox;
@@ -439,6 +487,7 @@ function bind() {
   (document.querySelector(`.tab[data-filter="${ui.filter}"]`) || document.querySelector('.tab')).classList.add('active');
   initMap();
   bind();
+  loadSettings();
   try {
     await loadProperties();
     renderAll();
