@@ -86,9 +86,23 @@ function extractListing(html, href) {
   area = area.replace(/,?\s*United Kingdom\s*$/i, '').replace(/\s+/g, ' ').trim();
   const locText = `${area} ${title} ${descr}`;
   const pcD = locText.match(/\b([A-Z]{1,2}\d[A-Z\d]?)\s+(\d[A-Z]{2})\b/);      // full postcode in the OG text
-  const postcode = pcD ? `${pcD[1]} ${pcD[2]}` : null;
+  let postcode = pcD ? `${pcD[1]} ${pcD[2]}` : null;
   const outcodes = [...area.matchAll(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g)].map(m => m[1]);
   const outcode = outcodes[outcodes.length - 1] || null;
+  // If the OG text only exposed an outcode (e.g. "E17"), recover the FULL postcode from
+  // the page body so we can geocode to the exact street instead of the outcode centroid.
+  // Guard: only accept full postcodes sharing that outcode, and take the most frequent —
+  // the strict "OUT INC" shape (with a space) can't match CSS-hash junk like "C7D5FB".
+  if (!postcode && outcode) {
+    const counts = new Map();
+    for (const m of html.matchAll(/\b([A-Z]{1,2}\d[A-Z\d]?)\s+(\d[A-Z]{2})\b/g)) {
+      if (m[1].toUpperCase() === outcode.toUpperCase()) {
+        const full = `${m[1]} ${m[2]}`.toUpperCase();
+        counts.set(full, (counts.get(full) || 0) + 1);
+      }
+    }
+    if (counts.size) postcode = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  }
   // Precise coordinates if the page embeds them (OnTheMarket does); else null.
   const cm = html.match(/"lat(?:itude)?"\s*:\s*(-?5\d\.\d{3,})[\s\S]{0,40}?"l(?:ng|on|ongitude)"\s*:\s*(-?\d\.\d{3,})/);
   const coords = cm ? { lat: +cm[1], lng: +cm[2] } : null;
@@ -347,6 +361,33 @@ async function refreshCommutes() {
     try { await storeCommutes(p.id, dests.length ? await computeCommutes(p, dests) : []); } catch { }
   }
 }
+// Re-geocode saved homes to their exact street postcode. Older/discovered listings that
+// only had an outcode landed on the district centroid (several stacking on one point);
+// this re-reads each page, recovers the full postcode, and moves the pin to the real
+// spot, then refreshes area intelligence + commutes for the new location.
+async function refineLocations() {
+  const props = (await db.execute('SELECT id, listing_url, latitude, longitude, price, area FROM properties WHERE listing_url IS NOT NULL')).rows;
+  const tflKey = process.env.TFL_APP_KEY;
+  const dests = await getDestinations();
+  let updated = 0; const changes = [];
+  for (const p of props) {
+    try {
+      const resp = await fetch(p.listing_url, { redirect: 'follow', headers: { 'User-Agent': BROWSER_UA, 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' }, signal: AbortSignal.timeout(20000) });
+      if (!resp.ok) { await sleep(400); continue; }
+      const ex = extractListing(await resp.text(), p.listing_url);
+      let lat = ex.coords ? ex.coords.lat : null, lng = ex.coords ? ex.coords.lng : null;
+      if (lat == null && ex.postcode) { const g = await geocode(ex.postcode, null); if (g) { lat = g.lat; lng = g.lng; } } // precise postcode only — never the outcode fallback
+      if (lat == null) { await sleep(400); continue; }
+      if (Math.abs(lat - p.latitude) + Math.abs(lng - p.longitude) < 1e-6) { await sleep(400); continue; } // already precise
+      await db.execute({ sql: 'UPDATE properties SET latitude=?, longitude=? WHERE id=?', args: [lat, lng, p.id] });
+      updated++; changes.push({ id: p.id, postcode: ex.postcode || null });
+      try { const data = await computeInsights({ latitude: lat, longitude: lng, price: p.price, area: p.area }, { tflKey }); await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [p.id, JSON.stringify(data), data.computedAt] }); } catch { }
+      try { if (dests.length) await storeCommutes(p.id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { }
+    } catch { }
+    await sleep(400);
+  }
+  return { updated, changes };
+}
 
 // --- weekly email summary (Resend) ----------------------------------------
 const SITE_URL = 'https://project-nest-2mzu.onrender.com';
@@ -524,6 +565,10 @@ createServer(async (req, res) => {
   if (url.pathname === '/api/send-weekly' && req.method === 'POST') {
     try { return send(res, 200, JSON.stringify(await sendWeekly())); }
     catch (e) { return send(res, 200, JSON.stringify({ sent: 0, error: String(e && e.message || e) })); }
+  }
+  if (url.pathname === '/api/regeocode' && req.method === 'POST') {
+    try { return send(res, 200, JSON.stringify(await refineLocations())); }
+    catch (e) { return send(res, 200, JSON.stringify({ updated: 0, error: String(e && e.message || e) })); }
   }
   if (url.pathname === '/api/settings' && req.method === 'GET')
     return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []) }));
