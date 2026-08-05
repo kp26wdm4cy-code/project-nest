@@ -360,18 +360,20 @@ async function sendWeekly() {
     ${(!newSug.length && !drops.length) ? `<p style="color:#556">No new suggestions or price drops this week — nothing new beat what you already have.</p>` : ''}
     <p style="margin-top:26px"><a href="${SITE_URL}" style="background:#285b43;color:#fff;padding:11px 20px;text-decoration:none;border-radius:4px;display:inline-block">Open Nest ↗</a></p>
     <p style="color:#99a;font-size:12px;margin-top:24px">You subscribed to this in Nest. To stop, remove your address in the app.</p></div>`;
-  const key = process.env.RESEND_API_KEY;
-  if (!key) return { sent: 0, note: 'RESEND_API_KEY not set — nothing sent', preview: { newSug: newSug.length, drops: drops.length, to: emails } };
-  const from = process.env.RESEND_FROM || 'Nest <onboarding@resend.dev>';
+  // Sent via SendGrid: verify one sender address (SENDGRID_FROM) and it can email
+  // any subscriber — no domain needed.
+  const key = process.env.SENDGRID_API_KEY, from = process.env.SENDGRID_FROM;
+  if (!key || !from) return { sent: 0, note: 'SENDGRID_API_KEY / SENDGRID_FROM not set — nothing sent', preview: { newSug: newSug.length, drops: drops.length, to: emails } };
+  const subject = `Nest weekly — ${newSug.length} new, ${drops.length} price drop${drops.length === 1 ? '' : 's'}`;
   let sent = 0; const errors = [];
   for (const to of emails) {
     try {
-      const r = await fetch('https://api.resend.com/emails', {
+      const r = await fetch('https://api.sendgrid.com/v3/mail/send', {
         method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from, to, subject: `Nest weekly — ${newSug.length} new, ${drops.length} price drop${drops.length === 1 ? '' : 's'}`, html }),
+        body: JSON.stringify({ personalizations: [{ to: [{ email: to }] }], from: { email: from, name: 'Nest' }, subject, content: [{ type: 'text/html', value: html }] }),
         signal: AbortSignal.timeout(15000),
       });
-      if (r.ok) sent++; else errors.push(`${to}: ${r.status} ${(await r.text()).slice(0, 100)}`);
+      if (r.ok || r.status === 202) sent++; else errors.push(`${to}: ${r.status} ${(await r.text()).slice(0, 120)}`);
     } catch (e) { errors.push(`${to}: ${e.message}`); }
     await new Promise(r => setTimeout(r, 300));
   }
