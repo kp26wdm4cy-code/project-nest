@@ -91,17 +91,23 @@ function extractListing(html, href) {
   const outcode = outcodes[outcodes.length - 1] || null;
   // If the OG text only exposed an outcode (e.g. "E17"), recover the FULL postcode from
   // the page body so we can geocode to the exact street instead of the outcode centroid.
-  // Guard: only accept full postcodes sharing that outcode, and take the most frequent —
-  // the strict "OUT INC" shape (with a space) can't match CSS-hash junk like "C7D5FB".
-  if (!postcode && outcode) {
-    const counts = new Map();
-    for (const m of html.matchAll(/\b([A-Z]{1,2}\d[A-Z\d]?)\s+(\d[A-Z]{2})\b/g)) {
-      if (m[1].toUpperCase() === outcode.toUpperCase()) {
-        const full = `${m[1]} ${m[2]}`.toUpperCase();
-        counts.set(full, (counts.get(full) || 0) + 1);
+  // The property's own postcode sits right next to its listing id in the page data
+  // (e.g. "E3 3HY","Resale","None",89030907); the estate agent's postcode is elsewhere,
+  // so we pick by PROXIMITY to the id — not frequency (the agent's can appear more often).
+  const rmId = (href.match(/\/properties\/(\d{5,})/) || href.match(/(\d{6,})/) || [])[1];
+  if (!postcode && rmId) {
+    const idPos = [];
+    for (const m of html.matchAll(new RegExp(rmId, 'g'))) idPos.push(m.index);
+    if (idPos.length) {
+      let best = null, bestD = Infinity;
+      for (const m of html.matchAll(/\b[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}\b/g)) {
+        const oc = m[0].replace(/\s?\d[A-Z]{2}$/i, '').toUpperCase();
+        if (outcode && oc !== outcode.toUpperCase()) continue; // keep it in the listing's own area
+        const d = Math.min(...idPos.map(p => Math.abs(p - m.index)));
+        if (d < bestD) { bestD = d; best = m[0]; }
       }
+      if (best && bestD < 200) { const s = best.replace(/\s+/g, '').toUpperCase(); postcode = s.slice(0, -3) + ' ' + s.slice(-3); }
     }
-    if (counts.size) postcode = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
   }
   // Precise coordinates if the page embeds them (OnTheMarket does); else null.
   const cm = html.match(/"lat(?:itude)?"\s*:\s*(-?5\d\.\d{3,})[\s\S]{0,40}?"l(?:ng|on|ongitude)"\s*:\s*(-?\d\.\d{3,})/);
@@ -366,8 +372,7 @@ async function refreshCommutes() {
 // this re-reads each page, recovers the full postcode, and moves the pin to the real
 // spot, then refreshes area intelligence + commutes for the new location.
 async function refineLocations() {
-  const props = (await db.execute('SELECT id, listing_url, latitude, longitude, price, area FROM properties WHERE listing_url IS NOT NULL')).rows;
-  const tflKey = process.env.TFL_APP_KEY;
+  const props = (await db.execute('SELECT id, listing_url, latitude, longitude FROM properties WHERE listing_url IS NOT NULL')).rows;
   const dests = await getDestinations();
   let updated = 0; const changes = [];
   for (const p of props) {
@@ -381,8 +386,7 @@ async function refineLocations() {
       if (Math.abs(lat - p.latitude) + Math.abs(lng - p.longitude) < 1e-6) { await sleep(400); continue; } // already precise
       await db.execute({ sql: 'UPDATE properties SET latitude=?, longitude=? WHERE id=?', args: [lat, lng, p.id] });
       updated++; changes.push({ id: p.id, postcode: ex.postcode || null });
-      try { const data = await computeInsights({ latitude: lat, longitude: lng, price: p.price, area: p.area }, { tflKey }); await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [p.id, JSON.stringify(data), data.computedAt] }); } catch { }
-      try { if (dests.length) await storeCommutes(p.id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { }
+      try { if (dests.length) await storeCommutes(p.id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { } // area intelligence (~1mi radius) barely shifts; refresh()/boot recomputes it
     } catch { }
     await sleep(400);
   }
