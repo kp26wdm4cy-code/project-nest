@@ -160,10 +160,22 @@ function initMap() {
 function refreshMarkers() {
   Object.values(markers).forEach(m => map.removeLayer(m));
   markers = {};
-  properties.forEach(p => {
+  const visible = properties.filter(p => statusOf(p) !== 'Pass'); // passed homes are hidden from the map
+  // Some homes only geocode to their postcode-district centre, so several can land on
+  // the exact same point. Fan those out in a small ring so none hides behind another.
+  const groups = {};
+  visible.forEach(p => { const k = `${p.latitude.toFixed(5)},${p.longitude.toFixed(5)}`; (groups[k] = groups[k] || []).push(p); });
+  visible.forEach(p => {
+    let lat = p.latitude, lng = p.longitude;
+    const grp = groups[`${p.latitude.toFixed(5)},${p.longitude.toFixed(5)}`];
+    if (grp.length > 1) {
+      const i = grp.indexOf(p), ang = (2 * Math.PI * i) / grp.length, r = 0.0009; // ~90m
+      lat += r * Math.cos(ang);
+      lng += r * Math.sin(ang) / Math.cos(lat * Math.PI / 180);
+    }
     const face = p.id === selectedId ? '●' : Math.round(p.price / 1000) + 'k';
     const icon = L.divIcon({ className: '', html: `<div class="pin ${markerClass(p)} ${p.availability === 'off-market' ? 'gone' : ''}">${face}</div>`, iconSize: [36, 36], iconAnchor: [18, 18] });
-    markers[p.id] = L.marker([p.latitude, p.longitude], { icon, title: p.name }).addTo(map).on('click', () => select(p.id));
+    markers[p.id] = L.marker([lat, lng], { icon, title: p.name }).addTo(map).on('click', () => select(p.id));
   });
 }
 
