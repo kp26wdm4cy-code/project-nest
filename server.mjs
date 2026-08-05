@@ -135,6 +135,7 @@ async function addListing(listingUrl, opts = {}) {
         await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), data.computedAt] });
       } catch { }
     })();
+    (async () => { try { const dests = await getDestinations(); if (dests.length) await storeCommutes(id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { } })();
   }
   return { ok: true, id, name, existing: !!exists };
 }
@@ -289,7 +290,8 @@ async function initialise() {
     property_id TEXT PRIMARY KEY, data TEXT NOT NULL, fetched_at TEXT NOT NULL,
     FOREIGN KEY(property_id) REFERENCES properties(id)
   );
-  CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+  CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS commutes (property_id TEXT PRIMARY KEY, data TEXT NOT NULL, computed_at TEXT NOT NULL);`);
   // Columns added over time — guarded so re-running is harmless.
   for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL']) {
     try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
@@ -305,6 +307,76 @@ async function setSetting(key, value) {
   await db.execute({ sql: 'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', args: [key, JSON.stringify(value)] });
 }
 const DEFAULT_DISTRICTS = ['N1', 'E2', 'E9', 'E3', 'N16', 'N5', 'E8', 'E5']; // Hoxton, Victoria Park, Bow, Stoke Newington, Highbury…
+const getDestinations = () => getSetting('destinations', []);
+
+// --- commute times (TfL Journey Planner) ----------------------------------
+async function computeCommutes(property, destinations) {
+  const out = [];
+  const key = process.env.TFL_APP_KEY ? `?app_key=${encodeURIComponent(process.env.TFL_APP_KEY)}` : '';
+  const from = `${property.latitude},${property.longitude}`;
+  for (const d of destinations) {
+    try {
+      const url = `https://api.tfl.gov.uk/Journey/JourneyResults/${encodeURIComponent(from)}/to/${encodeURIComponent(d.postcode)}${key}`;
+      const r = await fetch(url, { headers: { 'User-Agent': 'Project-Nest/1.0' }, signal: AbortSignal.timeout(15000) });
+      if (!r.ok) { out.push({ name: d.name, postcode: d.postcode, minutes: null }); continue; }
+      const journeys = (await r.json()).journeys || [];
+      if (!journeys.length) { out.push({ name: d.name, postcode: d.postcode, minutes: null }); continue; }
+      const best = journeys.reduce((a, b) => (a.duration <= b.duration ? a : b));
+      const modes = [...new Set((best.legs || []).map(l => l.mode && l.mode.name).filter(m => m && m !== 'walking'))];
+      out.push({ name: d.name, postcode: d.postcode, minutes: best.duration, modes });
+    } catch { out.push({ name: d.name, postcode: d.postcode, minutes: null }); }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return out;
+}
+async function storeCommutes(id, data) {
+  await db.execute({ sql: `INSERT INTO commutes(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), new Date().toISOString()] });
+}
+async function refreshCommutes() {
+  const dests = await getDestinations();
+  const props = (await db.execute('SELECT id, latitude, longitude FROM properties')).rows;
+  for (const p of props) {
+    try { await storeCommutes(p.id, dests.length ? await computeCommutes(p, dests) : []); } catch { }
+  }
+}
+
+// --- weekly email summary (Resend) ----------------------------------------
+const SITE_URL = 'https://project-nest-2mzu.onrender.com';
+async function sendWeekly() {
+  const emails = await getSetting('emails', []);
+  if (!emails.length) return { sent: 0, note: 'no subscribers' };
+  const all = await rows('');
+  const weekAgo = Date.now() - 7 * 864e5;
+  const newSug = all.filter(p => p.tags.includes('suggested') && p.created_at && Date.parse(p.created_at) >= weekAgo);
+  const drops = all.filter(p => p.price_changed_at && Date.parse(p.price_changed_at) >= weekAgo && p.prev_price && p.price < p.prev_price);
+  const keepers = all.filter(p => p.feedback.some(f => ['Love', 'View', 'Watch'].includes(f.verdict)));
+  const gbp = n => '£' + Number(n).toLocaleString('en-GB');
+  const item = p => `<tr><td style="padding:9px 0;border-top:1px solid #eee"><a href="${p.listing_url}" style="color:#285b43;font-weight:600;text-decoration:none">${p.name}</a><br><span style="color:#667;font-size:13px">${p.area} · ${gbp(p.price)}${(p.prev_price && p.price < p.prev_price) ? ` · ↓ was ${gbp(p.prev_price)}` : ''}</span></td></tr>`;
+  const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:auto;color:#17251f;padding:8px">
+    <h2 style="font-weight:600;margin:0 0 4px">Nest — your week in the home search</h2>
+    <p style="color:#556">${all.length} homes on your list · ${keepers.length} keeper${keepers.length === 1 ? '' : 's'}.</p>
+    ${newSug.length ? `<h3 style="margin:22px 0 4px">✨ ${newSug.length} new suggestion${newSug.length > 1 ? 's' : ''} this week</h3><table style="width:100%;border-collapse:collapse">${newSug.slice(0, 8).map(item).join('')}</table>` : ''}
+    ${drops.length ? `<h3 style="margin:22px 0 4px">↓ ${drops.length} price drop${drops.length > 1 ? 's' : ''}</h3><table style="width:100%;border-collapse:collapse">${drops.slice(0, 8).map(item).join('')}</table>` : ''}
+    ${(!newSug.length && !drops.length) ? `<p style="color:#556">No new suggestions or price drops this week — nothing new beat what you already have.</p>` : ''}
+    <p style="margin-top:26px"><a href="${SITE_URL}" style="background:#285b43;color:#fff;padding:11px 20px;text-decoration:none;border-radius:4px;display:inline-block">Open Nest ↗</a></p>
+    <p style="color:#99a;font-size:12px;margin-top:24px">You subscribed to this in Nest. To stop, remove your address in the app.</p></div>`;
+  const key = process.env.RESEND_API_KEY;
+  if (!key) return { sent: 0, note: 'RESEND_API_KEY not set — nothing sent', preview: { newSug: newSug.length, drops: drops.length, to: emails } };
+  const from = process.env.RESEND_FROM || 'Nest <onboarding@resend.dev>';
+  let sent = 0; const errors = [];
+  for (const to of emails) {
+    try {
+      const r = await fetch('https://api.resend.com/emails', {
+        method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to, subject: `Nest weekly — ${newSug.length} new, ${drops.length} price drop${drops.length === 1 ? '' : 's'}`, html }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (r.ok) sent++; else errors.push(`${to}: ${r.status} ${(await r.text()).slice(0, 100)}`);
+    } catch (e) { errors.push(`${to}: ${e.message}`); }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return { sent, newSug: newSug.length, drops: drops.length, errors };
+}
 
 async function seed() {
   const created = new Date().toISOString();
@@ -324,9 +396,11 @@ async function rows(person) {
   const feedback = (await db.execute('SELECT property_id, person, verdict, note, updated_at FROM feedback')).rows;
   const insights = (await db.execute('SELECT property_id, data FROM insights')).rows;
   const media = (await db.execute('SELECT property_id, data FROM media')).rows;
+  const commutes = (await db.execute('SELECT property_id, data FROM commutes')).rows;
   return properties.map(p => {
     const ins = insights.find(i => i.property_id === p.id);
     const med = media.find(m => m.property_id === p.id);
+    const com = commutes.find(c => c.property_id === p.id);
     return {
       ...p,
       tags: String(p.tags).split('|'),
@@ -334,6 +408,7 @@ async function rows(person) {
       mine: feedback.find(f => f.property_id === p.id && f.person === person) || null,
       insights: ins ? JSON.parse(ins.data) : null,
       media: med ? JSON.parse(med.data) : null,
+      commutes: com ? JSON.parse(com.data) : [],
     };
   });
 }
@@ -436,13 +511,27 @@ createServer(async (req, res) => {
     try { return send(res, 200, JSON.stringify(await discover(scheduled ? { max: 8, poolCap: 20, maxAreas: 8 } : {}))); }
     catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Search did not complete (Rightmove may be rate-limiting). Try again shortly.' })); }
   }
-  if (url.pathname === '/api/settings' && req.method === 'GET') return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts() }));
+  if (url.pathname === '/api/send-weekly' && req.method === 'POST') {
+    try { return send(res, 200, JSON.stringify(await sendWeekly())); }
+    catch (e) { return send(res, 200, JSON.stringify({ sent: 0, error: String(e && e.message || e) })); }
+  }
+  if (url.pathname === '/api/settings' && req.method === 'GET')
+    return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []) }));
   if (url.pathname === '/api/settings' && req.method === 'PUT') {
     let body = ''; for await (const chunk of req) body += chunk;
     try {
-      const { searchDistricts } = JSON.parse(body || '{}');
-      if (Array.isArray(searchDistricts)) await setSetting('search_districts', [...new Set(searchDistricts.filter(x => /^[A-Z]{1,2}\d[A-Z\d]?$/i.test(x)).map(x => x.toUpperCase()))].slice(0, 60));
-      return send(res, 200, JSON.stringify({ ok: true, searchDistricts: await getSearchDistricts() }));
+      const b = JSON.parse(body || '{}');
+      if (Array.isArray(b.searchDistricts)) await setSetting('search_districts', [...new Set(b.searchDistricts.filter(x => /^[A-Z]{1,2}\d[A-Z\d]?$/i.test(x)).map(x => x.toUpperCase()))].slice(0, 60));
+      if (Array.isArray(b.destinations)) {
+        const clean = b.destinations
+          .filter(d => d && d.name && /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/i.test(String(d.postcode).trim()))
+          .map(d => ({ name: String(d.name).slice(0, 40).trim(), postcode: String(d.postcode).toUpperCase().replace(/\s+/g, ' ').trim() }))
+          .slice(0, 6);
+        await setSetting('destinations', clean);
+        refreshCommutes().catch(() => {}); // recompute in the background
+      }
+      if (Array.isArray(b.emails)) await setSetting('emails', b.emails.filter(e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e))).map(e => String(e).toLowerCase()).slice(0, 6));
+      return send(res, 200, JSON.stringify({ ok: true, searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []) }));
     } catch { return send(res, 400, JSON.stringify({ error: 'Invalid settings' })); }
   }
   if (url.pathname === '/api/properties' && req.method === 'POST') {
@@ -493,6 +582,12 @@ createServer(async (req, res) => {
   } catch (e) { console.log('Area-intelligence bootstrap skipped:', e && e.message); }
   try { console.log('Fetching listing galleries…'); await bootstrapMedia(); console.log('Galleries ready.'); }
   catch (e) { console.log('Gallery bootstrap skipped:', e && e.message); }
+  try {
+    const dests = await getDestinations();
+    const have = (await db.execute('SELECT COUNT(*) AS n FROM commutes')).rows[0].n;
+    const total = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
+    if (dests.length && have < total) { console.log('Computing commute times…'); await refreshCommutes(); console.log('Commutes ready.'); }
+  } catch (e) { console.log('Commute bootstrap skipped:', e && e.message); }
 })();
 
 setInterval(() => refresh().catch(() => {}), checkEveryMs).unref();

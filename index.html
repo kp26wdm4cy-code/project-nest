@@ -56,6 +56,26 @@
       <p id="addStatus" class="add-status">Add a home and Nest pulls in its photos, floor plan and area intelligence — or let it suggest homes from what you’ve liked.</p>
     </section>
 
+    <section class="dest-bar" aria-label="Commute destinations">
+      <div class="dest-head"><strong>Commute check</strong><span>Add places you travel to — Nest shows the public-transport time from every home.</span></div>
+      <div id="destChips" class="dest-chips"></div>
+      <div class="dest-add">
+        <input id="destName" type="text" placeholder="Name (e.g. Ralf’s work)" maxlength="40" />
+        <input id="destPostcode" type="text" placeholder="Postcode (e.g. EC2M 7PY)" />
+        <button type="button" id="destAdd" class="lead-btn ghost">+ Add place</button>
+      </div>
+    </section>
+
+    <section class="dest-bar" aria-label="Weekly email">
+      <div class="dest-head"><strong>Weekly email</strong><span>A Sunday-morning summary of new suggestions and price drops.</span></div>
+      <div id="emailChips" class="dest-chips"></div>
+      <div class="dest-add">
+        <input id="emailInput" type="email" placeholder="you@email.com" />
+        <button type="button" id="emailAdd" class="lead-btn ghost">Subscribe</button>
+      </div>
+      <p id="emailStatus" class="add-status"></p>
+    </section>
+
     <section class="workspace" aria-label="Curated property workspace">
       <div class="map-panel"><div id="map" aria-label="Map of current property leads"></div><button type="button" id="areaToggle" class="area-toggle">◧ Search areas</button><p class="map-note">Pins show the listing street or postcode centre. Tap “Search areas” to choose the postcode districts Nest searches.</p></div>
       <aside class="queue-panel">

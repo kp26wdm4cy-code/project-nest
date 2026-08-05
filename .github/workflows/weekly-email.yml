@@ -1,0 +1,18 @@
+name: Weekly email summary
+
+# Sends the weekly summary to subscribers every Sunday morning.
+# GitHub cron is UTC: 07:00 UTC ≈ 08:00 London during BST (summer), 07:00 in winter.
+on:
+  schedule:
+    - cron: '0 7 * * 0'   # Sundays 07:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send weekly summary
+        run: |
+          echo "Sending Nest weekly summary…"
+          curl -fsS -X POST "https://project-nest-2mzu.onrender.com/api/send-weekly" \
+            --max-time 120 --retry 2 || echo "Send failed (Render may have been slow to wake)."

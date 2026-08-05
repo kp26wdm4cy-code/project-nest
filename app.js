@@ -12,6 +12,7 @@ let selectedId = null;
 let map, markers = {};
 let galShots = [], galIndex = 0;  // current gallery images for the full-screen viewer
 let districtLayer = null, selectedDistricts = new Set(), areaMode = false, saveDistTimer;
+let destinations = [], subscribedEmails = [];
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
 const byId = id => properties.find(p => p.id === id);
@@ -166,13 +167,64 @@ function refreshMarkers() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; } catch { }
   updateAreaToggle();
+  showDistricts();   // always render a faint shade for the selected areas
+  renderDestChips();
+  renderEmailChips();
+}
+function renderDestChips() {
+  const box = document.getElementById('destChips');
+  if (!box) return;
+  box.innerHTML = destinations.length
+    ? destinations.map((d, i) => `<span class="dest-chip">${d.name} · ${d.postcode}<button data-i="${i}" aria-label="Remove ${d.name}">×</button></span>`).join('')
+    : '<span class="dest-empty">No places added yet.</span>';
+  box.querySelectorAll('button[data-i]').forEach(b => b.onclick = () => removeDest(+b.dataset.i));
+}
+async function saveDestinations() {
+  try {
+    const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ destinations }) })).json();
+    destinations = s.destinations || destinations; renderDestChips();
+  } catch { }
+  // commute times recompute server-side in the background — reload to show them
+  if (destinations.length) setTimeout(async () => { await loadProperties(); renderAll(); }, 6500);
+}
+function addDest() {
+  const nEl = document.getElementById('destName'), pEl = document.getElementById('destPostcode');
+  const n = (nEl.value || '').trim(), p = (pEl.value || '').trim();
+  if (!n || !/^[A-Za-z]{1,2}\d[A-Za-z\d]?\s*\d[A-Za-z]{2}$/.test(p)) { pEl.focus(); return; }
+  if (destinations.length >= 6) return;
+  destinations.push({ name: n.slice(0, 40), postcode: p.toUpperCase() });
+  nEl.value = ''; pEl.value = '';
+  renderDestChips(); saveDestinations();
+}
+function removeDest(i) { destinations.splice(i, 1); renderDestChips(); saveDestinations(); }
+
+function renderEmailChips() {
+  const box = document.getElementById('emailChips');
+  if (!box) return;
+  box.innerHTML = subscribedEmails.length
+    ? subscribedEmails.map((e, i) => `<span class="dest-chip">${e}<button data-i="${i}" aria-label="Unsubscribe ${e}">×</button></span>`).join('')
+    : '<span class="dest-empty">No one subscribed yet.</span>';
+  box.querySelectorAll('button[data-i]').forEach(b => b.onclick = () => { subscribedEmails.splice(+b.dataset.i, 1); renderEmailChips(); saveEmails('Removed.'); });
+}
+async function saveEmails(msg) {
+  try { const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ emails: subscribedEmails }) })).json(); subscribedEmails = s.emails || subscribedEmails; renderEmailChips(); }
+  catch { }
+  const st = document.getElementById('emailStatus'); if (st && msg) st.textContent = msg;
+}
+function addEmail() {
+  const el = document.getElementById('emailInput'); const v = (el.value || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) { el.focus(); return; }
+  if (!subscribedEmails.includes(v)) subscribedEmails.push(v);
+  el.value = ''; renderEmailChips(); saveEmails('Subscribed — you’ll get a summary each Sunday morning.');
 }
 function districtStyle(name) {
   const on = selectedDistricts.has(name);
-  return { color: on ? '#285b43' : '#9aa79c', weight: on ? 1.6 : 0.6, fillColor: '#285b43', fillOpacity: on ? 0.3 : 0.05 };
+  if (!areaMode) return on ? { fill: true, fillColor: '#285b43', fillOpacity: 0.1, color: '#5d9b75', weight: 1, opacity: 0.5 } : { fill: false, stroke: false };
+  return on ? { fill: true, fillColor: '#285b43', fillOpacity: 0.3, color: '#285b43', weight: 1.6, opacity: 1 } : { fill: true, fillColor: '#285b43', fillOpacity: 0.05, color: '#9aa79c', weight: 0.6, opacity: 0.85 };
 }
+function restyleDistricts() { if (districtLayer) districtLayer.setStyle(f => districtStyle(f.properties.name)); }
 async function ensureDistricts() {
   if (districtLayer) return districtLayer;
   const geo = await (await fetch('/districts.geojson', { cache: 'force-cache' })).json();
@@ -182,6 +234,7 @@ async function ensureDistricts() {
       const name = f.properties.name;
       layer.bindTooltip(name, { sticky: true, direction: 'top', className: 'dist-tip' });
       layer.on('click', () => {
+        if (!areaMode) return;
         selectedDistricts.has(name) ? selectedDistricts.delete(name) : selectedDistricts.add(name);
         layer.setStyle(districtStyle(name));
         updateAreaToggle();
@@ -192,11 +245,17 @@ async function ensureDistricts() {
   });
   return districtLayer;
 }
+async function showDistricts() {
+  const layer = await ensureDistricts().catch(() => null);
+  if (!layer) return;
+  if (!map.hasLayer(layer)) layer.addTo(map);
+  restyleDistricts();
+}
 async function toggleAreas() {
   areaMode = !areaMode;
-  const layer = await ensureDistricts();
-  if (areaMode) { layer.addTo(map); layer.setStyle(f => districtStyle(f.properties.name)); }
-  else map.removeLayer(layer);
+  await showDistricts();
+  document.querySelector('.map-panel')?.classList.toggle('editing', areaMode);
+  restyleDistricts();
   updateAreaToggle();
 }
 function updateAreaToggle() {
@@ -282,6 +341,7 @@ function renderDetail() {
       <span class="avail ${av.cls} big">${av.text}</span><span class="checked">${whenChecked(p.last_checked)}</span></p>
     <p class="agent-view">${p.agent_view}</p>
     <div class="questions"><strong>Before you book it</strong>${p.checks}</div>
+    ${(p.commutes && p.commutes.length) ? `<div class="commutes"><strong>Getting to your places</strong>${p.commutes.map(c => `<div class="commute-row"><span class="cm-name">${c.name}</span><b class="cm-min">${c.minutes != null ? c.minutes + ' min' : '—'}</b><span class="cm-mode">${c.minutes != null ? (c.modes && c.modes.length ? c.modes.join(' · ') : 'walk') : 'no route'}</span></div>`).join('')}</div>` : ''}
   </div>
   <div class="reaction">
     <p class="kicker">SHARED VERDICT · YOU ARE ${ui.person.toUpperCase()}</p>
@@ -321,13 +381,20 @@ async function onVerdict(p, verdict) {
 function openLightbox(i) {
   if (!galShots.length) return;
   galIndex = (i % galShots.length + galShots.length) % galShots.length;
+  const lb = document.getElementById('lightbox');
+  lb.classList.remove('zoomed');
   document.getElementById('lbImg').src = galShots[galIndex];
   document.getElementById('lbCount').textContent = `${galIndex + 1} / ${galShots.length}`;
-  document.getElementById('lightbox').hidden = false;
+  lb.hidden = false;
   document.body.classList.add('lb-open');
 }
-function lbStep(d) { openLightbox(galIndex + d); }
-function closeLightbox() { document.getElementById('lightbox').hidden = true; document.body.classList.remove('lb-open'); }
+function lbStep(d) { document.getElementById('lightbox').classList.remove('zoomed'); openLightbox(galIndex + d); }
+function toggleZoom() {
+  const lb = document.getElementById('lightbox');
+  const on = lb.classList.toggle('zoomed');
+  if (on) requestAnimationFrame(() => { lb.scrollTo((lb.scrollWidth - lb.clientWidth) / 2, (lb.scrollHeight - lb.clientHeight) / 2); });
+}
+function closeLightbox() { const lb = document.getElementById('lightbox'); lb.hidden = true; lb.classList.remove('zoomed'); document.body.classList.remove('lb-open'); }
 
 function renderLearning() {
   const mine = properties.map(p => p.mine).filter(Boolean);
@@ -464,11 +531,16 @@ function bind() {
   const discoverBtn = document.getElementById('discoverBtn');
   if (discoverBtn) discoverBtn.onclick = () => submitDiscover(discoverBtn);
   document.getElementById('areaToggle')?.addEventListener('click', toggleAreas);
+  document.getElementById('destAdd')?.addEventListener('click', addDest);
+  document.getElementById('destPostcode')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addDest(); } });
+  document.getElementById('emailAdd')?.addEventListener('click', addEmail);
+  document.getElementById('emailInput')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addEmail(); } });
   const lb = document.getElementById('lightbox');
   if (lb) {
     lb.querySelector('.lb-close').onclick = closeLightbox;
     lb.querySelector('.lb-prev').onclick = e => { e.stopPropagation(); lbStep(-1); };
     lb.querySelector('.lb-next').onclick = e => { e.stopPropagation(); lbStep(1); };
+    document.getElementById('lbImg').onclick = e => { e.stopPropagation(); toggleZoom(); };
     lb.addEventListener('click', e => { if (e.target === lb) closeLightbox(); });
     document.addEventListener('keydown', e => {
       if (lb.hidden) return;
