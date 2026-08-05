@@ -385,7 +385,7 @@ async function onVerdict(p, verdict) {
   const next = p.mine?.verdict === verdict ? null : verdict; // tap again to clear
   try {
     await saveFeedback(p, { verdict: next });
-    renderDetail(); renderList(); refreshMarkers(); renderLearning();
+    renderDetail(); renderList(); refreshMarkers(); renderLearning(); renderBrief();
   } catch {
     const s = document.getElementById('savedNote'); if (s) s.textContent = 'Could not save — is the server running?';
   }
@@ -423,6 +423,33 @@ function renderLearning() {
       <p>${notes.length ? `You have left ${notes.length} note${notes.length > 1 ? 's' : ''} for the next scout.` : 'The next useful signal is why — light, layout, street, building or location.'}${passes ? ` ${passes} pass${passes > 1 ? 'es' : ''} help me avoid similar homes.` : ''}</p>`;
   }
   document.getElementById('learningText').innerHTML = html;
+}
+
+// Live brief signals derived from the current contributor's keepers (Love/View/Watch —
+// the same set as the Keepers tab). Updates on every verdict.
+const ocOf = a => { const m = [...String(a || '').matchAll(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g)]; return m.length ? m[m.length - 1][1].toUpperCase() : null; };
+function renderBrief() {
+  const homeEl = document.getElementById('briefKeepers'), areaEl = document.getElementById('briefLeaning');
+  if (!homeEl && !areaEl) return;
+  const keepers = properties.filter(p => ['Love', 'View', 'Watch'].includes(statusOf(p)));
+  if (!keepers.length) { if (homeEl) homeEl.textContent = ''; if (areaEl) areaEl.textContent = ''; return; }
+  // price range
+  const prices = keepers.map(p => p.price).filter(n => n > 0).sort((a, b) => a - b);
+  let priceStr = '';
+  if (prices.length) { const lo = Math.round(prices[0] / 1000), hi = Math.round(prices[prices.length - 1] / 1000); priceStr = lo === hi ? `£${lo}k` : `£${lo}k–£${hi}k`; }
+  // bed mix (span + most common)
+  const bedCounts = {};
+  keepers.forEach(p => { if (p.bedrooms) bedCounts[p.bedrooms] = (bedCounts[p.bedrooms] || 0) + 1; });
+  const beds = Object.keys(bedCounts).map(Number).sort((a, b) => a - b);
+  let bedStr = '';
+  if (beds.length === 1) bedStr = `${beds[0]}-bed`;
+  else if (beds.length > 1) { const top = beds.slice().sort((a, b) => bedCounts[b] - bedCounts[a])[0]; bedStr = `${beds[0]}–${beds[beds.length - 1]} bed, mostly ${top}-bed`; }
+  if (homeEl) homeEl.textContent = `Your keepers so far (${keepers.length}): ${[priceStr, bedStr].filter(Boolean).join(', ')}.`;
+  // areas leaning toward: keeper outcodes, most-kept first
+  const oc = {};
+  keepers.forEach(p => { const o = ocOf(p.area); if (o) oc[o] = (oc[o] || 0) + 1; });
+  const top = Object.keys(oc).sort((a, b) => oc[b] - oc[a]);
+  if (areaEl) areaEl.textContent = top.length ? `Leaning toward ${top.slice(0, 5).join(', ')}${top.length > 5 ? ` +${top.length - 5} more` : ''}.` : '';
 }
 
 function renderLeadNote() {
@@ -524,7 +551,7 @@ function removeProperty(p) {
 }
 
 function renderAll() {
-  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderLeadNote();
+  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote();
 }
 
 function bind() {
