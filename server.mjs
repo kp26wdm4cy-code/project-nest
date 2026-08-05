@@ -67,6 +67,21 @@ async function geocode(postcode, outcode) {
   return null;
 }
 async function getJsonQuick(u) { const r = await fetch(u, { signal: AbortSignal.timeout(10000) }); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }
+// Tenure (Leasehold / Freehold / Share of freehold) + years left on the lease, if the
+// listing states them. Two sources: the visible "TENURE" info-reel and the page data
+// (`…"yearsRemainingOnLease":N…},"LEASEHOLD",999,` — tenure then years-remaining).
+function extractTenure(html) {
+  let tenure = null, leaseYears = null;
+  const tm = html.match(/>TENURE<[\s\S]{0,220}?<p[^>]*>([^<]{3,40})<\/p>/i);
+  if (tm && /lease|free|commonhold|share/i.test(tm[1])) tenure = tm[1].replace(/\s+/g, ' ').trim();
+  const lm = html.match(/"tenureType":\d+,"yearsRemainingOnLease":\d+,"message":\d+\},"([A-Za-z ]+)",(\d+)/);
+  if (lm) {
+    if (!tenure && /lease|free|share|common/i.test(lm[1])) { const s = lm[1].toLowerCase(); tenure = s.charAt(0).toUpperCase() + s.slice(1); }
+    const y = +lm[2]; if (y >= 1 && y <= 1200) leaseYears = y;
+  }
+  if (tenure && /^free/i.test(tenure)) leaseYears = null; // freehold has no lease term
+  return { tenure, leaseYears };
+}
 function extractListing(html, href) {
   const title = ogMeta(html, 'title') || '';
   const descr = ogMeta(html, 'description') || '';
@@ -114,7 +129,8 @@ function extractListing(html, href) {
   const coords = cm ? { lat: +cm[1], lng: +cm[2] } : null;
   const media = extractMedia(html, href);
   if (!media.photos.length && image) media.photos = [image];
-  return { title, descr, beds, type, price, area, postcode, outcode, coords, media };
+  const { tenure, leaseYears } = extractTenure(html);
+  return { title, descr, beds, type, price, area, postcode, outcode, coords, media, tenure, leaseYears };
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function addListing(listingUrl, opts = {}) {
@@ -142,11 +158,11 @@ async function addListing(listingUrl, opts = {}) {
   const tags = [ex.type, ex.outcode, opts.reason ? 'suggested' : null].filter(Boolean).join('|');
   if (!exists) {
     await db.execute({
-      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score,tenure,lease_years)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       args: [id, name, areaLabel, ex.price, ex.beds || 0, 'Size TBC', lat, lng, u.href, 'View', 'Medium', agentView,
         'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.',
-        tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null],
+        tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null, ex.tenure || null, ex.leaseYears || null],
     });
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
     (async () => {
@@ -313,7 +329,7 @@ async function initialise() {
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS commutes (property_id TEXT PRIMARY KEY, data TEXT NOT NULL, computed_at TEXT NOT NULL);`);
   // Columns added over time — guarded so re-running is harmless.
-  for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL']) {
+  for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER']) {
     try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
   }
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
@@ -506,11 +522,11 @@ function send(res, code, body, type = 'application/json; charset=utf-8') { res.w
 function csv(value) { const text = value == null ? '' : String(value); return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
 
 async function exportCsv() {
-  const headings = ['Property', 'Area', 'Price', 'Bedrooms', 'Size', 'Recommendation', 'Confidence', 'Availability', 'Listing link', 'Latitude', 'Longitude', 'Last checked', 'Ralf verdict', 'Ralf note', 'Hannah verdict', 'Hannah note', 'Agent view', 'Checks'];
+  const headings = ['Property', 'Area', 'Price', 'Bedrooms', 'Size', 'Tenure', 'Lease years', 'Recommendation', 'Confidence', 'Availability', 'Listing link', 'Latitude', 'Longitude', 'Last checked', 'Ralf verdict', 'Ralf note', 'Hannah verdict', 'Hannah note', 'Agent view', 'Checks'];
   const all = await rows('');
   const lines = all.map(p => {
     const f = person => p.feedback.find(x => x.person.toLowerCase() === person.toLowerCase()) || {};
-    return [p.name, p.area, p.price, p.bedrooms, p.size, p.recommendation, p.confidence, p.availability, p.listing_url, p.latitude, p.longitude, p.last_checked, f('Ralf').verdict, f('Ralf').note, f('Hannah').verdict, f('Hannah').note, p.agent_view, p.checks].map(csv).join(',');
+    return [p.name, p.area, p.price, p.bedrooms, p.size, p.tenure, p.lease_years, p.recommendation, p.confidence, p.availability, p.listing_url, p.latitude, p.longitude, p.last_checked, f('Ralf').verdict, f('Ralf').note, f('Hannah').verdict, f('Hannah').note, p.agent_view, p.checks].map(csv).join(',');
   });
   return [headings.join(','), ...lines].join('\r\n');
 }
@@ -528,6 +544,8 @@ async function refresh() {
       await db.execute({ sql: 'UPDATE properties SET availability=?, last_checked=? WHERE id=?', args: [unavailable ? 'off-market' : 'available', now, item.id] });
       // Reuse the page we just downloaded to refresh the photo/floorplan gallery.
       try { const m = extractMedia(html, item.listing_url); if (m.photos.length || m.floorplans.length) await storeMedia(item.id, m); } catch { /* leave last-good media */ }
+      // …and to backfill tenure / lease length when the listing states them.
+      try { const { tenure, leaseYears } = extractTenure(html); if (tenure) await db.execute({ sql: 'UPDATE properties SET tenure=?, lease_years=? WHERE id=?', args: [tenure, leaseYears, item.id] }); } catch { }
       // Price-change tracking: record the previous price + when it changed.
       try {
         const ogp = `${ogMeta(html, 'title') || ''} ${ogMeta(html, 'description') || ''}`;

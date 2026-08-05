@@ -351,7 +351,7 @@ function renderDetail() {
         <button type="button" id="removeHome" class="remove-home">Remove home</button>
       </div>
     </div>
-    <p class="facts">${p.area} · ${money(p.price)}${priceDrop(p) ? ` <span class="drop big">↓ £${priceDrop(p)}k from ${money(p.prev_price)}</span>` : ''} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}
+    <p class="facts">${p.area} · ${money(p.price)}${priceDrop(p) ? ` <span class="drop big">↓ £${priceDrop(p)}k from ${money(p.prev_price)}</span>` : ''} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}${p.tenure ? ` · <span class="tenure${p.lease_years && p.lease_years < 90 ? ' short' : ''}">${p.tenure}${p.lease_years ? ` · ${p.lease_years}-yr lease` : ''}</span>` : ''}
       <span class="avail ${av.cls} big">${av.text}</span><span class="checked">${whenChecked(p.last_checked)}</span></p>
     <p class="agent-view">${p.agent_view}</p>
     <div class="questions"><strong>Before you book it</strong>${p.checks}</div>
