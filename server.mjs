@@ -74,7 +74,8 @@ function extractTenure(html) {
   let tenure = null, leaseYears = null;
   const tm = html.match(/>TENURE<[\s\S]{0,220}?<p[^>]*>([^<]{3,40})<\/p>/i);
   if (tm && /lease|free|commonhold|share/i.test(tm[1])) tenure = tm[1].replace(/\s+/g, ' ').trim();
-  const lm = html.match(/"tenureType":\d+,"yearsRemainingOnLease":\d+,"message":\d+\},"([A-Za-z ]+)",(\d+)/);
+  // Quotes in this data are backslash-escaped (\"LEASEHOLD\",999) — tolerate the backslashes.
+  const lm = html.match(/yearsRemainingOnLease\\?":\d+[\s\S]{0,40}?\},\\?"([A-Za-z ]+?)\\?",(\d+)/);
   if (lm) {
     if (!tenure && /lease|free|share|common/i.test(lm[1])) { const s = lm[1].toLowerCase(); tenure = s.charAt(0).toUpperCase() + s.slice(1); }
     const y = +lm[2]; if (y >= 1 && y <= 1200) leaseYears = y;
