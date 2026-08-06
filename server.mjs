@@ -20,8 +20,10 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 function extractMedia(html, listingUrl) {
   const id = (String(listingUrl).match(/(\d{5,})/) || [])[1]; // rightmove /properties/ID, OTM /details/ID
   if (!id) return { photos: [], floorplans: [], fetchedAt: new Date().toISOString() };
-  const all = [...new Set((html.match(/https:\/\/media\.(?:rightmove\.co\.uk|onthemarket\.com)\/[^"'\\ )]+\.(?:jpe?g|png)/gi) || []))]
-    .filter(u => u.includes('/' + id + '/'));
+  const rx = /https:\/\/media\.(?:rightmove\.co\.uk|onthemarket\.com)\/[^"'\\ )]+\.(?:jpe?g|png)/gi;
+  // Scan the raw HTML AND a copy with escaped slashes (\/) unescaped, so floorplan/photo
+  // URLs that only appear inside the page's JSON data are caught too.
+  const all = [...new Set([...(html.match(rx) || []), ...(html.replace(/\\\//g, '/').match(rx) || [])])];
   const isFloor = u => /property-floorplan|_FLP_|floorplan/i.test(u);
   // The same image often appears at several sizes (a tiny "_max_296x197" thumbnail
   // AND a full-res version). Group by the image's hash and keep the largest — the
@@ -37,8 +39,10 @@ function extractMedia(html, listingUrl) {
     }
     return [...groups.values()].map(x => x.u);
   };
+  // Floorplans: a `property-floorplan` URL is always this listing's own, so don't require
+  // the id (some don't include it). Photos: keep the id filter to drop "similar properties".
   const floorplans = dedupe(all.filter(isFloor)).slice(0, 4);
-  const photos = dedupe(all.filter(u => !isFloor(u))).slice(0, 30);
+  const photos = dedupe(all.filter(u => !isFloor(u) && u.includes('/' + id + '/'))).slice(0, 30);
   return { photos, floorplans, fetchedAt: new Date().toISOString() };
 }
 async function storeMedia(id, media) {
@@ -82,6 +86,20 @@ function extractTenure(html) {
   }
   if (tenure && /^free/i.test(tenure)) leaseYears = null; // freehold has no lease term
   return { tenure, leaseYears };
+}
+// Floor area as "NN sq m" (metric, per preference). Reads the number printed on the
+// floor plan / stated in the listing — from the visible size info-reel first, then the
+// page data; converts from sq ft only if that's all the listing gives.
+function extractSize(html) {
+  const sm = html.match(/>\s*([\d,]{1,6})\s*sq\s*m\s*<\/p>/i);
+  if (sm) { const m = +sm[1].replace(/,/g, ''); if (m >= 10 && m <= 5000) return `${m} sq m`; }
+  const ft = html.match(/>\s*([\d,]{2,7})\s*sq\s*ft\s*<\/p>/i);
+  if (ft) { const f = +ft[1].replace(/,/g, ''); if (f >= 100 && f <= 100000) return `${Math.round(f * 0.092903)} sq m`; }
+  const rm = html.match(/sqm\\?",\\?"sq\.?\s*m\.?\\?",(\d{2,5})/i);
+  if (rm) { const m = +rm[1]; if (m >= 10 && m <= 5000) return `${m} sq m`; }
+  const rf = html.match(/sqft\\?",\\?"sq\.?\s*ft\.?\\?",(\d{3,6})/i);
+  if (rf) { const f = +rf[1]; if (f >= 100 && f <= 100000) return `${Math.round(f * 0.092903)} sq m`; }
+  return null;
 }
 function extractListing(html, href) {
   const title = ogMeta(html, 'title') || '';
@@ -131,7 +149,8 @@ function extractListing(html, href) {
   const media = extractMedia(html, href);
   if (!media.photos.length && image) media.photos = [image];
   const { tenure, leaseYears } = extractTenure(html);
-  return { title, descr, beds, type, price, area, postcode, outcode, coords, media, tenure, leaseYears };
+  const size = extractSize(html);
+  return { title, descr, beds, type, price, area, postcode, outcode, coords, media, tenure, leaseYears, size };
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function addListing(listingUrl, opts = {}) {
@@ -143,6 +162,15 @@ async function addListing(listingUrl, opts = {}) {
   if (!resp.ok) return { error: `That page returned ${resp.status}.` + (/zoopla/i.test(u.hostname) ? ' Zoopla often blocks automated reads — a Rightmove link is most reliable.' : '') };
   const html = await resp.text();
   const ex = extractListing(html, u.href);
+  // A first fetch occasionally lands on a consent/bot page with no images; retry once so
+  // the floor plan/photos (and size) reliably come through when adding a link.
+  if (!ex.media.photos.length && !ex.media.floorplans.length) {
+    try {
+      await sleep(1200);
+      const r2 = await fetch(u.href, { redirect: 'follow', headers: { 'User-Agent': BROWSER_UA, 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' }, signal: AbortSignal.timeout(20000) });
+      if (r2.ok) { const h2 = await r2.text(); const m2 = extractMedia(h2, u.href); if (m2.photos.length || m2.floorplans.length) ex.media = m2; if (!ex.size) { const s2 = extractSize(h2); if (s2) ex.size = s2; } }
+    } catch { }
+  }
   let lat = ex.coords ? ex.coords.lat : null, lng = ex.coords ? ex.coords.lng : null, district = null;
   if (lat == null) { const geo = await geocode(ex.postcode, ex.outcode); if (geo) { lat = geo.lat; lng = geo.lng; district = geo.district; } }
   if (lat == null) return { error: 'Could not work out the location from that page. A Rightmove link works best.' };
@@ -161,7 +189,7 @@ async function addListing(listingUrl, opts = {}) {
     await db.execute({
       sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score,tenure,lease_years)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      args: [id, name, areaLabel, ex.price, ex.beds || 0, 'Size TBC', lat, lng, u.href, 'View', 'Medium', agentView,
+      args: [id, name, areaLabel, ex.price, ex.beds || 0, ex.size || 'Size TBC', lat, lng, u.href, 'View', 'Medium', agentView,
         'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.',
         tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null, ex.tenure || null, ex.leaseYears || null],
     });
@@ -545,8 +573,9 @@ async function refresh() {
       await db.execute({ sql: 'UPDATE properties SET availability=?, last_checked=? WHERE id=?', args: [unavailable ? 'off-market' : 'available', now, item.id] });
       // Reuse the page we just downloaded to refresh the photo/floorplan gallery.
       try { const m = extractMedia(html, item.listing_url); if (m.photos.length || m.floorplans.length) await storeMedia(item.id, m); } catch { /* leave last-good media */ }
-      // …and to backfill tenure / lease length when the listing states them.
+      // …and to backfill tenure / lease length / floor area when the listing states them.
       try { const { tenure, leaseYears } = extractTenure(html); if (tenure) await db.execute({ sql: 'UPDATE properties SET tenure=?, lease_years=? WHERE id=?', args: [tenure, leaseYears, item.id] }); } catch { }
+      try { const s = extractSize(html); if (s) await db.execute({ sql: 'UPDATE properties SET size=? WHERE id=?', args: [s, item.id] }); } catch { }
       // Price-change tracking: record the previous price + when it changed.
       try {
         const ogp = `${ogMeta(html, 'title') || ''} ${ogMeta(html, 'description') || ''}`;

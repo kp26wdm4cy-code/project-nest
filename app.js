@@ -17,7 +17,10 @@ let destinations = [], subscribedEmails = [];
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
 const byId = id => properties.find(p => p.id === id);
 const partner = () => (ui.person === 'Ralf' ? 'Hannah' : 'Ralf');
-const statusOf = p => p.mine?.verdict || 'queue';
+// Pass is a shared veto: if EITHER person has passed a home it counts as Passed for
+// both (out of the queue/keepers, hidden from the map). Otherwise it's this person's own
+// verdict. Each person's reaction buttons still reflect their own choice (p.mine).
+const statusOf = p => (p.feedback || []).some(f => f.verdict === 'Pass') ? 'Pass' : (p.mine?.verdict || 'queue');
 const partnerVerdict = p => (p.feedback || []).find(f => f.person === partner() && f.verdict) || null;
 const label = status => ({ queue: 'To review', Love: 'Keeper', View: 'Worth viewing', Watch: 'Watch', Pass: 'Passed' })[status] || status;
 const verdictText = v => ({ Love: '♥ Love it', View: '✓ Would view', Watch: '◌ Watch', Pass: '× Forget it' })[v] || v;
