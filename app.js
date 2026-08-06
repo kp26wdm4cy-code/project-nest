@@ -346,7 +346,7 @@ function marketFacts(p) {
   }
   if (p.last_sold_price) {
     const when = fmtMonth(p.last_sold_date);
-    bits.push(`<span>💷 ${p.last_sold_exact ? 'Last sold' : 'Last sold nearby (same postcode)'} ${money(p.last_sold_price)}${when ? ` · ${when}` : ''}</span>`);
+    bits.push(`<span>💷 ${p.last_sold_exact ? 'Last sold' : 'Nearby sale (same postcode)'} ${money(p.last_sold_price)}${when ? ` · ${when}` : ''}</span>`);
   }
   return bits.length ? `<div class="market-facts">${bits.join('')}</div>` : '';
 }

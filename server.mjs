@@ -104,25 +104,34 @@ function extractSize(html) {
 // Last recorded sale from HM Land Registry Price Paid data (by postcode). If the listing
 // address carries a house/flat number we can match the exact unit; otherwise we return
 // the most recent sale in that postcode, flagged as not-exact so the UI can say so.
-async function fetchSold(postcode, address) {
+// Returns {price,date,exact} or null when the query succeeds but nothing comparable is
+// found. Throws on a network/HTTP failure so callers can tell "no record" from "lookup
+// failed" (and not wipe a good stored value on a blip).
+async function fetchSold(postcode, address, opts = {}) {
   if (!postcode) return null;
-  try {
-    const data = await getJsonQuick(`https://landregistry.data.gov.uk/data/ppi/transaction-record.json?propertyAddress.postcode=${encodeURIComponent(postcode)}&_pageSize=40&_sort=-transactionDate`);
-    const items = (data.result && data.result.items) || [];
-    if (!items.length) return null;
-    const val = x => (x && typeof x === 'object' && '_value' in x) ? x._value : x;
-    const up = s => String(s == null ? '' : val(s)).toUpperCase();
-    const nums = [...String(address || '').matchAll(/\b(\d{1,4}[a-z]?)\b/gi)].map(m => m[1].toUpperCase());
-    let match = null;
-    if (nums.length) match = items.find(it => {
-      const a = it.propertyAddress || {}, paon = up(a.paon), saon = up(a.saon);
-      return nums.some(n => paon === n || saon === n || saon === `FLAT ${n}` || paon.split(/\W+/).includes(n) || saon.split(/\W+/).includes(n));
-    });
-    const it = match || items[0];
-    const price = +val(it.pricePaid), d = new Date(val(it.transactionDate));
-    if (!price || isNaN(d.getTime())) return null;
-    return { price, date: d.toISOString().slice(0, 10), exact: !!match };
-  } catch { return null; }
+  const data = await getJsonQuick(`https://landregistry.data.gov.uk/data/ppi/transaction-record.json?propertyAddress.postcode=${encodeURIComponent(postcode)}&_pageSize=60&_sort=-transactionDate`);
+  const items = (data.result && data.result.items) || []; // already newest-first
+  if (!items.length) return null;
+  const val = x => (x && typeof x === 'object' && '_value' in x) ? x._value : x;
+  const up = s => String(s == null ? '' : val(s)).toUpperCase();
+  const out = it => { const price = +val(it.pricePaid), d = new Date(val(it.transactionDate)); return (price && !isNaN(d.getTime())) ? { price, date: d.toISOString().slice(0, 10) } : null; };
+  // 1) Exact unit match when the listing address carries a house/flat number.
+  const nums = [...String(address || '').matchAll(/\b(\d{1,4}[a-z]?)\b/gi)].map(m => m[1].toUpperCase());
+  if (nums.length) {
+    const m = items.find(it => { const a = it.propertyAddress || {}, paon = up(a.paon), saon = up(a.saon); return nums.some(n => paon === n || saon === n || saon === `FLAT ${n}` || paon.split(/\W+/).includes(n) || saon.split(/\W+/).includes(n)); });
+    if (m) { const o = out(m); if (o) return { ...o, exact: true }; }
+  }
+  // 2) Otherwise the most recent COMPARABLE sale in the postcode: same property type
+  //    (flat) and within a sane band of the asking price — avoids quoting a nearby
+  //    mansion's price for a small flat.
+  const lo = opts.price ? opts.price * 0.4 : 0, hi = opts.price ? opts.price * 1.8 : Infinity;
+  const comp = items.find(it => {
+    const price = +val(it.pricePaid); if (!(price >= lo && price <= hi)) return false;
+    if (opts.flat) { const t = up(it.propertyType && it.propertyType._about); if (t && !/FLAT|MAISON/.test(t)) return false; }
+    return true;
+  });
+  if (comp) { const o = out(comp); if (o) return { ...o, exact: false }; }
+  return null;
 }
 function extractListing(html, href) {
   const title = ogMeta(html, 'title') || '';
@@ -228,7 +237,7 @@ async function addListing(listingUrl, opts = {}) {
       } catch { }
     })();
     (async () => { try { const dests = await getDestinations(); if (dests.length) await storeCommutes(id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { } })();
-    (async () => { try { const sold = await fetchSold(ex.postcode, ex.area); if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, id] }); } catch { } })();
+    (async () => { try { const sold = await fetchSold(ex.postcode, ex.area, { price: ex.price, flat: /flat|apartment|maison|studio/i.test(ex.type) }); if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, id] }); } catch { } })();
   }
   return { ok: true, id, name, existing: !!exists };
 }
@@ -619,8 +628,10 @@ async function refresh() {
       try {
         const ex = extractListing(html, item.listing_url);
         if (ex.listedDate) await db.execute({ sql: 'UPDATE properties SET listed_date=?, listed_reason=? WHERE id=?', args: [ex.listedDate, ex.listedReason, item.id] });
-        const sold = await fetchSold(ex.postcode, ex.area);
-        if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, item.id] });
+        // set-or-clear: a successful lookup with no comparable clears any stale value;
+        // a network error throws above and leaves the existing value untouched.
+        const sold = await fetchSold(ex.postcode, ex.area, { price: item.price, flat: /flat|apartment|maison|studio/i.test(ex.type) });
+        await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold ? sold.price : null, sold ? sold.date : null, sold ? (sold.exact ? 1 : 0) : null, item.id] });
       } catch { }
       // Price-change tracking: record the previous price + when it changed.
       try {
