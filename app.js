@@ -178,6 +178,12 @@ function refreshMarkers() {
     markers[p.id] = L.marker([lat, lng], { icon, title: p.name }).addTo(map).on('click', () => select(p.id));
   });
 }
+// Zoom/pan the map to fit every pin currently shown (the non-passed homes).
+function fitToProperties() {
+  const ms = Object.values(markers);
+  if (!ms.length) return;
+  map.fitBounds(L.featureGroup(ms).getBounds(), { padding: [45, 45], maxZoom: 15 });
+}
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
@@ -572,6 +578,7 @@ function bind() {
   const discoverBtn = document.getElementById('discoverBtn');
   if (discoverBtn) discoverBtn.onclick = () => submitDiscover(discoverBtn);
   document.getElementById('areaToggle')?.addEventListener('click', toggleAreas);
+  document.getElementById('zoomExtent')?.addEventListener('click', fitToProperties);
   document.getElementById('destAdd')?.addEventListener('click', addDest);
   document.getElementById('destPostcode')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addDest(); } });
   document.getElementById('emailAdd')?.addEventListener('click', addEmail);
