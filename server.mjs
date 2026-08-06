@@ -561,7 +561,7 @@ async function exportCsv() {
 }
 
 async function refresh() {
-  const items = (await db.execute({ sql: 'SELECT id, listing_url, price FROM properties WHERE availability != ?', args: ['off-market'] })).rows;
+  const items = (await db.execute({ sql: 'SELECT id, listing_url, price, size FROM properties WHERE availability != ?', args: ['off-market'] })).rows;
   const now = new Date().toISOString();
   const results = [];
   for (const item of items) {
@@ -575,7 +575,14 @@ async function refresh() {
       try { const m = extractMedia(html, item.listing_url); if (m.photos.length || m.floorplans.length) await storeMedia(item.id, m); } catch { /* leave last-good media */ }
       // …and to backfill tenure / lease length / floor area when the listing states them.
       try { const { tenure, leaseYears } = extractTenure(html); if (tenure) await db.execute({ sql: 'UPDATE properties SET tenure=?, lease_years=? WHERE id=?', args: [tenure, leaseYears, item.id] }); } catch { }
-      try { const s = extractSize(html); if (s) await db.execute({ sql: 'UPDATE properties SET size=? WHERE id=?', args: [s, item.id] }); } catch { }
+      try {
+        const s = extractSize(html);
+        if (s) { await db.execute({ sql: 'UPDATE properties SET size=? WHERE id=?', args: [s, item.id] }); }
+        else if (item.size && /m²|sq\s*ft/i.test(item.size)) { // normalise a legacy mixed-unit size to sq m
+          const m = item.size.match(/([\d,]+)\s*(?:sq\s*m|m²|m2)/i);
+          if (m) await db.execute({ sql: 'UPDATE properties SET size=? WHERE id=?', args: [`${m[1].replace(/,/g, '')} sq m`, item.id] });
+        }
+      } catch { }
       // Price-change tracking: record the previous price + when it changed.
       try {
         const ogp = `${ogMeta(html, 'title') || ''} ${ogMeta(html, 'description') || ''}`;
