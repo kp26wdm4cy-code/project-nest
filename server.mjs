@@ -283,7 +283,7 @@ async function capSuggestions(cap) {
     ORDER BY COALESCE(suggest_score,0) DESC`)).rows;
   const doomed = rows.slice(cap).map(r => r.id);
   for (const id of doomed) {
-    for (const t of ['feedback', 'insights', 'media']) await db.execute({ sql: `DELETE FROM ${t} WHERE property_id=?`, args: [id] });
+    for (const t of ['feedback', 'insights', 'media', 'commutes', 'guest_notes']) await db.execute({ sql: `DELETE FROM ${t} WHERE property_id=?`, args: [id] });
     await db.execute({ sql: 'DELETE FROM properties WHERE id=?', args: [id] });
   }
   return doomed.length;
@@ -356,7 +356,8 @@ async function initialise() {
     FOREIGN KEY(property_id) REFERENCES properties(id)
   );
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS commutes (property_id TEXT PRIMARY KEY, data TEXT NOT NULL, computed_at TEXT NOT NULL);`);
+  CREATE TABLE IF NOT EXISTS commutes (property_id TEXT PRIMARY KEY, data TEXT NOT NULL, computed_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS guest_notes (property_id TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL);`);
   // Columns added over time — guarded so re-running is harmless.
   for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER']) {
     try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
@@ -497,6 +498,7 @@ async function rows(person) {
   const insights = (await db.execute('SELECT property_id, data FROM insights')).rows;
   const media = (await db.execute('SELECT property_id, data FROM media')).rows;
   const commutes = (await db.execute('SELECT property_id, data FROM commutes')).rows;
+  const guests = (await db.execute('SELECT rowid AS id, property_id, name, body, created_at FROM guest_notes ORDER BY created_at ASC')).rows;
   return properties.map(p => {
     const ins = insights.find(i => i.property_id === p.id);
     const med = media.find(m => m.property_id === p.id);
@@ -509,6 +511,7 @@ async function rows(person) {
       insights: ins ? JSON.parse(ins.data) : null,
       media: med ? JSON.parse(med.data) : null,
       commutes: com ? JSON.parse(com.data) : [],
+      guestNotes: guests.filter(g => g.property_id === p.id),
     };
   });
 }
@@ -660,7 +663,7 @@ createServer(async (req, res) => {
   const del = url.pathname.match(/^\/api\/properties\/([^/]+)$/);
   if (del && req.method === 'DELETE') {
     const id = del[1];
-    for (const t of ['feedback', 'insights', 'media']) await db.execute({ sql: `DELETE FROM ${t} WHERE property_id=?`, args: [id] });
+    for (const t of ['feedback', 'insights', 'media', 'commutes', 'guest_notes']) await db.execute({ sql: `DELETE FROM ${t} WHERE property_id=?`, args: [id] });
     await db.execute({ sql: 'DELETE FROM properties WHERE id=?', args: [id] });
     return send(res, 200, JSON.stringify({ ok: true }));
   }
@@ -679,6 +682,25 @@ createServer(async (req, res) => {
       });
       return send(res, 200, JSON.stringify({ ok: true }));
     } catch { return send(res, 400, JSON.stringify({ error: 'Invalid feedback' })); }
+  }
+  // Guest notes — anyone can leave a named comment on a home (second opinions).
+  const gn = url.pathname.match(/^\/api\/properties\/([^/]+)\/notes$/);
+  if (gn && req.method === 'POST') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    try {
+      const { name, body: text } = JSON.parse(body || '{}');
+      const nm = String(name || '').trim().slice(0, 40), bd = String(text || '').trim().slice(0, 600);
+      if (!nm || !bd) return send(res, 400, JSON.stringify({ error: 'Name and note are both required.' }));
+      const exists = (await db.execute({ sql: 'SELECT 1 FROM properties WHERE id=?', args: [gn[1]] })).rows[0];
+      if (!exists) return send(res, 404, JSON.stringify({ error: 'No such home.' }));
+      await db.execute({ sql: 'INSERT INTO guest_notes(property_id,name,body,created_at) VALUES(?,?,?,?)', args: [gn[1], nm, bd, new Date().toISOString()] });
+      return send(res, 200, JSON.stringify({ ok: true }));
+    } catch { return send(res, 400, JSON.stringify({ error: 'Could not save that note.' })); }
+  }
+  const gd = url.pathname.match(/^\/api\/guest-notes\/(\d+)$/);
+  if (gd && req.method === 'DELETE') {
+    await db.execute({ sql: 'DELETE FROM guest_notes WHERE rowid=?', args: [+gd[1]] });
+    return send(res, 200, JSON.stringify({ ok: true }));
   }
   const file = staticFile(url.pathname);
   if (!file) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');

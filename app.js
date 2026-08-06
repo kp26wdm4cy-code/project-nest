@@ -24,6 +24,7 @@ const statusOf = p => (p.feedback || []).some(f => f.verdict === 'Pass') ? 'Pass
 const partnerVerdict = p => (p.feedback || []).find(f => f.person === partner() && f.verdict) || null;
 const label = status => ({ queue: 'To review', Love: 'Keeper', View: 'Worth viewing', Watch: 'Watch', Pass: 'Passed' })[status] || status;
 const verdictText = v => ({ Love: '♥ Love it', View: '✓ Would view', Watch: '◌ Watch', Pass: '× Forget it' })[v] || v;
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 // Map pins + list dots are coloured by verdict: love=vivid green, view=light green,
 // watch=faint yellow, forget=grey, not-yet-reviewed=neutral.
 const markerClass = p => ({ Love: 'v-love', View: 'v-view', Watch: 'v-watch', Pass: 'v-pass' })[statusOf(p)] || 'v-queue';
@@ -373,6 +374,16 @@ function renderDetail() {
     <div class="reaction-buttons">${['Love', 'View', 'Watch', 'Pass'].map(v => `<button data-verdict="${v}" class="${mine.verdict === v ? 'selected' : ''}">${verdictText(v)}</button>`).join('')}</div>
     <textarea id="note" placeholder="What works or puts you off? e.g. 'living room feels dark'">${mine.note || ''}</textarea>
     <div class="saved-note" id="savedNote">${mine.verdict || mine.note ? 'Saved on the shared server.' : ''}</div>
+    <div class="guest-notes">
+      <p class="kicker">SECOND OPINIONS</p>
+      <div class="guest-list">${(p.guestNotes || []).map(g => `<div class="guest-item"><div class="guest-head"><strong>${esc(g.name)}</strong><span class="guest-when">${whenChecked(g.created_at)}</span><button type="button" class="guest-del" data-note="${g.id}" title="Remove this note" aria-label="Remove note">×</button></div><p>${esc(g.body)}</p></div>`).join('') || '<p class="guest-empty">No notes yet — friends and family can leave one below.</p>'}</div>
+      <div class="guest-add">
+        <input id="guestName" type="text" placeholder="Your name" maxlength="40" autocomplete="off" />
+        <textarea id="guestBody" placeholder="Leave a note about this home…" maxlength="600"></textarea>
+        <button type="button" id="guestAdd" class="lead-btn ghost">Add note</button>
+      </div>
+      <div class="guest-status" id="guestStatus"></div>
+    </div>
   </div>`;
   galShots = shots; galIndex = 0;
   box.querySelectorAll('.thumb').forEach((t, i) => t.onclick = () => {
@@ -388,6 +399,24 @@ function renderDetail() {
     try { await saveFeedback(p, { note: e.target.value }); document.getElementById('savedNote').textContent = 'Note saved on the shared server.'; renderLearning(); }
     catch { document.getElementById('savedNote').textContent = 'Could not save — is the server running?'; }
   });
+  document.getElementById('guestAdd')?.addEventListener('click', () => submitGuestNote(p));
+  box.querySelectorAll('.guest-del').forEach(b => b.onclick = () => removeGuestNote(p, b.dataset.note));
+}
+// Second opinions: anyone can leave a named note on a home. Stored shared server-side.
+async function submitGuestNote(p) {
+  const name = (document.getElementById('guestName')?.value || '').trim();
+  const body = (document.getElementById('guestBody')?.value || '').trim();
+  const status = document.getElementById('guestStatus');
+  if (!name || !body) { if (status) status.textContent = 'Add your name and a note.'; return; }
+  if (status) status.textContent = 'Saving…';
+  try {
+    const r = await fetch(`/api/properties/${encodeURIComponent(p.id)}/notes`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, body }) });
+    if (!r.ok) throw new Error();
+    await loadProperties(); renderDetail();
+  } catch { if (status) status.textContent = 'Could not save — try again.'; }
+}
+async function removeGuestNote(p, id) {
+  try { await fetch(`/api/guest-notes/${encodeURIComponent(id)}`, { method: 'DELETE' }); await loadProperties(); renderDetail(); } catch { }
 }
 
 async function onVerdict(p, verdict) {
