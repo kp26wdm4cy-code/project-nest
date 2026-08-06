@@ -25,6 +25,9 @@ const partnerVerdict = p => (p.feedback || []).find(f => f.person === partner() 
 const label = status => ({ queue: 'To review', Love: 'Keeper', View: 'Worth viewing', Watch: 'Watch', Pass: 'Passed' })[status] || status;
 const verdictText = v => ({ Love: '♥ Love it', View: '✓ Would view', Watch: '◌ Watch', Pass: '× Forget it' })[v] || v;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const daysSince = iso => { const d = new Date(iso); return isNaN(d) ? null : Math.max(0, Math.round((Date.now() - d.getTime()) / 86400000)); };
+const fmtDate = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); };
+const fmtMonth = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }); };
 // Map pins + list dots are coloured by verdict: love=vivid green, view=light green,
 // watch=faint yellow, forget=grey, not-yet-reviewed=neutral.
 const markerClass = p => ({ Love: 'v-love', View: 'v-view', Watch: 'v-watch', Pass: 'v-pass' })[statusOf(p)] || 'v-queue';
@@ -333,6 +336,20 @@ function select(id) {
   refreshMarkers();
 }
 
+// Time-on-market + last-sold price line for the detail panel.
+function marketFacts(p) {
+  const bits = [];
+  if (p.listed_date) {
+    const when = fmtDate(p.listed_date), days = daysSince(p.listed_date);
+    if (p.listed_reason === 'reduced') bits.push(`<span>🏷️ Price reduced ${when}${days != null ? ` · ${days} day${days === 1 ? '' : 's'} ago` : ''}</span>`);
+    else bits.push(`<span>🕒 Listed ${when}${days != null ? ` · ${days} day${days === 1 ? '' : 's'} on the market` : ''}</span>`);
+  }
+  if (p.last_sold_price) {
+    const when = fmtMonth(p.last_sold_date);
+    bits.push(`<span>💷 ${p.last_sold_exact ? 'Last sold' : 'Last sold nearby (same postcode)'} ${money(p.last_sold_price)}${when ? ` · ${when}` : ''}</span>`);
+  }
+  return bits.length ? `<div class="market-facts">${bits.join('')}</div>` : '';
+}
 function renderDetail() {
   const p = byId(selectedId);
   const box = document.getElementById('propertyDetail');
@@ -363,6 +380,7 @@ function renderDetail() {
     </div>
     <p class="facts">${p.area} · ${money(p.price)}${priceDrop(p) ? ` <span class="drop big">↓ £${priceDrop(p)}k from ${money(p.prev_price)}</span>` : ''} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}${p.tenure ? ` · <span class="tenure${p.lease_years && p.lease_years < 90 ? ' short' : ''}">${p.tenure}${p.lease_years ? ` · ${p.lease_years}-yr lease` : ''}</span>` : ''}
       <span class="avail ${av.cls} big">${av.text}</span><span class="checked">${whenChecked(p.last_checked)}</span></p>
+    ${marketFacts(p)}
     <p class="agent-view">${p.agent_view}</p>
     <div class="questions"><strong>Before you book it</strong>${p.checks}</div>
     ${(p.commutes && p.commutes.length) ? `<div class="commutes"><strong>Getting to your places</strong>${p.commutes.map(c => `<div class="commute-row"><span class="cm-name">${c.name}</span><span class="cm-leg"><span class="cm-ico">🚉</span><b class="cm-min">${c.minutes != null ? c.minutes + ' min' : '—'}</b><span class="cm-mode">${c.minutes != null ? (c.modes && c.modes.length ? c.modes.join(' · ') : 'walk') : 'no transit route'}</span></span><span class="cm-leg cm-cycle"><span class="cm-ico">🚲</span><b class="cm-min">${c.cycleMinutes != null ? c.cycleMinutes + ' min' : '—'}</b><span class="cm-mode">${c.cycleMinutes != null ? 'cycle' : 'no cycle route'}</span></span></div>`).join('')}</div>` : ''}

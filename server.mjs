@@ -101,6 +101,29 @@ function extractSize(html) {
   if (rf) { const f = +rf[1]; if (f >= 100 && f <= 100000) return `${Math.round(f * 0.092903)} sq m`; }
   return null;
 }
+// Last recorded sale from HM Land Registry Price Paid data (by postcode). If the listing
+// address carries a house/flat number we can match the exact unit; otherwise we return
+// the most recent sale in that postcode, flagged as not-exact so the UI can say so.
+async function fetchSold(postcode, address) {
+  if (!postcode) return null;
+  try {
+    const data = await getJsonQuick(`https://landregistry.data.gov.uk/data/ppi/transaction-record.json?propertyAddress.postcode=${encodeURIComponent(postcode)}&_pageSize=40&_sort=-transactionDate`);
+    const items = (data.result && data.result.items) || [];
+    if (!items.length) return null;
+    const val = x => (x && typeof x === 'object' && '_value' in x) ? x._value : x;
+    const up = s => String(s == null ? '' : val(s)).toUpperCase();
+    const nums = [...String(address || '').matchAll(/\b(\d{1,4}[a-z]?)\b/gi)].map(m => m[1].toUpperCase());
+    let match = null;
+    if (nums.length) match = items.find(it => {
+      const a = it.propertyAddress || {}, paon = up(a.paon), saon = up(a.saon);
+      return nums.some(n => paon === n || saon === n || saon === `FLAT ${n}` || paon.split(/\W+/).includes(n) || saon.split(/\W+/).includes(n));
+    });
+    const it = match || items[0];
+    const price = +val(it.pricePaid), d = new Date(val(it.transactionDate));
+    if (!price || isNaN(d.getTime())) return null;
+    return { price, date: d.toISOString().slice(0, 10), exact: !!match };
+  } catch { return null; }
+}
 function extractListing(html, href) {
   const title = ogMeta(html, 'title') || '';
   const descr = ogMeta(html, 'description') || '';
@@ -150,7 +173,11 @@ function extractListing(html, href) {
   if (!media.photos.length && image) media.photos = [image];
   const { tenure, leaseYears } = extractTenure(html);
   const size = extractSize(html);
-  return { title, descr, beds, type, price, area, postcode, outcode, coords, media, tenure, leaseYears, size };
+  // "Added on 03/08/2026" / "Reduced on 03/08/2026" → ISO date + which reason.
+  let listedDate = null, listedReason = null;
+  const dm = html.match(/\b(Added|Reduced) on (\d{2})\/(\d{2})\/(\d{4})\b/i);
+  if (dm) { listedReason = dm[1].toLowerCase(); listedDate = `${dm[4]}-${dm[3]}-${dm[2]}`; }
+  return { title, descr, beds, type, price, area, postcode, outcode, coords, media, tenure, leaseYears, size, listedDate, listedReason };
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function addListing(listingUrl, opts = {}) {
@@ -187,11 +214,11 @@ async function addListing(listingUrl, opts = {}) {
   const tags = [ex.type, ex.outcode, opts.reason ? 'suggested' : null].filter(Boolean).join('|');
   if (!exists) {
     await db.execute({
-      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score,tenure,lease_years)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score,tenure,lease_years,listed_date,listed_reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       args: [id, name, areaLabel, ex.price, ex.beds || 0, ex.size || 'Size TBC', lat, lng, u.href, 'View', 'Medium', agentView,
         'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.',
-        tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null, ex.tenure || null, ex.leaseYears || null],
+        tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null, ex.tenure || null, ex.leaseYears || null, ex.listedDate || null, ex.listedReason || null],
     });
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
     (async () => {
@@ -201,6 +228,7 @@ async function addListing(listingUrl, opts = {}) {
       } catch { }
     })();
     (async () => { try { const dests = await getDestinations(); if (dests.length) await storeCommutes(id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { } })();
+    (async () => { try { const sold = await fetchSold(ex.postcode, ex.area); if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, id] }); } catch { } })();
   }
   return { ok: true, id, name, existing: !!exists };
 }
@@ -359,7 +387,8 @@ async function initialise() {
   CREATE TABLE IF NOT EXISTS commutes (property_id TEXT PRIMARY KEY, data TEXT NOT NULL, computed_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS guest_notes (property_id TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL);`);
   // Columns added over time — guarded so re-running is harmless.
-  for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER']) {
+  for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER',
+    'listed_date TEXT', 'listed_reason TEXT', 'last_sold_price INTEGER', 'last_sold_date TEXT', 'last_sold_exact INTEGER']) {
     try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
   }
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
@@ -554,11 +583,11 @@ function send(res, code, body, type = 'application/json; charset=utf-8') { res.w
 function csv(value) { const text = value == null ? '' : String(value); return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
 
 async function exportCsv() {
-  const headings = ['Property', 'Area', 'Price', 'Bedrooms', 'Size', 'Tenure', 'Lease years', 'Recommendation', 'Confidence', 'Availability', 'Listing link', 'Latitude', 'Longitude', 'Last checked', 'Ralf verdict', 'Ralf note', 'Hannah verdict', 'Hannah note', 'Agent view', 'Checks'];
+  const headings = ['Property', 'Area', 'Price', 'Bedrooms', 'Size', 'Tenure', 'Lease years', 'Listed', 'Last sold £', 'Last sold date', 'Recommendation', 'Confidence', 'Availability', 'Listing link', 'Latitude', 'Longitude', 'Last checked', 'Ralf verdict', 'Ralf note', 'Hannah verdict', 'Hannah note', 'Agent view', 'Checks'];
   const all = await rows('');
   const lines = all.map(p => {
     const f = person => p.feedback.find(x => x.person.toLowerCase() === person.toLowerCase()) || {};
-    return [p.name, p.area, p.price, p.bedrooms, p.size, p.tenure, p.lease_years, p.recommendation, p.confidence, p.availability, p.listing_url, p.latitude, p.longitude, p.last_checked, f('Ralf').verdict, f('Ralf').note, f('Hannah').verdict, f('Hannah').note, p.agent_view, p.checks].map(csv).join(',');
+    return [p.name, p.area, p.price, p.bedrooms, p.size, p.tenure, p.lease_years, p.listed_date, p.last_sold_price, p.last_sold_date, p.recommendation, p.confidence, p.availability, p.listing_url, p.latitude, p.longitude, p.last_checked, f('Ralf').verdict, f('Ralf').note, f('Hannah').verdict, f('Hannah').note, p.agent_view, p.checks].map(csv).join(',');
   });
   return [headings.join(','), ...lines].join('\r\n');
 }
@@ -585,6 +614,13 @@ async function refresh() {
           const m = item.size.match(/([\d,]+)\s*(?:sq\s*m|m²|m2)/i);
           if (m) await db.execute({ sql: 'UPDATE properties SET size=? WHERE id=?', args: [`${m[1].replace(/,/g, '')} sq m`, item.id] });
         }
+      } catch { }
+      // …and to backfill the listed date + last-sold price (HM Land Registry).
+      try {
+        const ex = extractListing(html, item.listing_url);
+        if (ex.listedDate) await db.execute({ sql: 'UPDATE properties SET listed_date=?, listed_reason=? WHERE id=?', args: [ex.listedDate, ex.listedReason, item.id] });
+        const sold = await fetchSold(ex.postcode, ex.area);
+        if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, item.id] });
       } catch { }
       // Price-change tracking: record the previous price + when it changed.
       try {
