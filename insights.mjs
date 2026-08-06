@@ -160,6 +160,35 @@ async function flood(lat, lng) {
   return { count: items.length, nearest: items[0]?.description || null };
 }
 
+// --- 7. HM Land Registry Price Paid: recent comparable sales nearby -------
+async function recentSales(postcode, price, flat) {
+  if (!postcode) return null;
+  const d = await getJson(`https://landregistry.data.gov.uk/data/ppi/transaction-record.json?propertyAddress.postcode=${encodeURIComponent(postcode)}&_pageSize=100&_sort=-transactionDate`);
+  const items = d.result?.items || []; // newest-first
+  if (!items.length) return null;
+  const val = x => (x && typeof x === 'object' && '_value' in x) ? x._value : x;
+  const title = s => String(s || '').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+  const rows = items.map(it => {
+    const p = +val(it.pricePaid), dt = new Date(val(it.transactionDate)), a = it.propertyAddress || {};
+    const uri = String(val(it.propertyType?._about) || '').toLowerCase();
+    const type = uri.includes('flat') ? 'Flat' : uri.includes('terrac') ? 'Terraced' : uri.includes('semi') ? 'Semi' : uri.includes('detached') ? 'Detached' : 'Home';
+    const label = title([val(a.saon), val(a.paon)].filter(Boolean).join(', ') || val(a.street) || '');
+    return { price: p, date: isNaN(dt.getTime()) ? null : dt.toISOString().slice(0, 10), type, uri, label };
+  }).filter(r => r.price && r.date);
+  // "Similar": same property type (flat) and within a sensible band of the guide price.
+  const lo = price ? price * 0.5 : 0, hi = price ? price * 1.7 : Infinity;
+  let sim = rows.filter(r => r.price >= lo && r.price <= hi && (!flat || /flat|maison/.test(r.uri)));
+  if (!sim.length) sim = rows.filter(r => r.price >= lo && r.price <= hi);
+  if (!sim.length) return null;
+  const sorted = sim.map(r => r.price).sort((a, b) => a - b);
+  return {
+    postcode, count: sim.length,
+    since: Math.min(...sim.map(r => +r.date.slice(0, 4))),
+    median: sorted[Math.floor(sorted.length / 2)],
+    sales: sim.slice(0, 6).map(r => ({ price: r.price, date: r.date, type: r.type, label: r.label })),
+  };
+}
+
 // --- orchestrate ---------------------------------------------------------
 export async function computeInsights(property, opts = {}) {
   const { latitude: lat, longitude: lng, price, area } = property;
@@ -168,12 +197,13 @@ export async function computeInsights(property, opts = {}) {
   const loc = await locate(lat, lng).catch(() => null);
   if (loc) { out.district = loc.district; out.postcode = loc.postcode; out.sources.push('postcodes.io'); }
 
-  const [pt, nb, tr, cr, fl] = await Promise.all([
+  const [pt, nb, tr, cr, fl, cp] = await Promise.all([
     (loc ? priceTrend(loc.district, price) : Promise.reject()).catch(() => null),
     nearby(lat, lng).catch(() => null),
     transport(lat, lng, opts.tflKey).catch(() => null),
     crime(lat, lng).catch(() => null),
     flood(lat, lng).catch(() => null),
+    (loc ? recentSales(loc.postcode, price, property.flat) : Promise.reject()).catch(() => null),
   ]);
 
   if (pt) {
@@ -196,6 +226,7 @@ export async function computeInsights(property, opts = {}) {
     out.sources.push('OpenStreetMap');
     if (nb.greenCount) out.drivers.push(`${nb.greenCount} named park${nb.greenCount > 1 ? 's' : ''}/greens within ~1.3km${nb.topGreen ? ', incl. ' + nb.topGreen : ''}`);
   }
+  if (cp) { out.comps = cp; if (!out.sources.includes('HM Land Registry')) out.sources.push('HM Land Registry'); }
   if (cr) { out.crime = cr; out.sources.push('Police.uk'); }
   if (fl) {
     out.flood = fl;

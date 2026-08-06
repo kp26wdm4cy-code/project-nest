@@ -232,7 +232,7 @@ async function addListing(listingUrl, opts = {}) {
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
     (async () => {
       try {
-        const data = await computeInsights({ latitude: lat, longitude: lng, price: ex.price, area: areaLabel }, { tflKey });
+        const data = await computeInsights({ latitude: lat, longitude: lng, price: ex.price, area: areaLabel, flat: /flat|apartment|maison|studio/i.test(ex.type) }, { tflKey });
         await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), data.computedAt] });
       } catch { }
     })();
@@ -571,11 +571,11 @@ async function bootstrapMedia() {
 // Compute live area intelligence for every property and cache it in the DB.
 // Sequential with a gap so we stay gentle on the shared public APIs (esp. Overpass).
 async function refreshInsights() {
-  const props = (await db.execute('SELECT id, area, price, latitude, longitude FROM properties')).rows;
+  const props = (await db.execute('SELECT id, name, area, price, latitude, longitude FROM properties')).rows;
   const done = [];
   for (const p of props) {
     try {
-      const data = await computeInsights(p, { tflKey });
+      const data = await computeInsights({ ...p, flat: /flat|apartment|maison|studio/i.test(p.name) }, { tflKey });
       await db.execute({
         sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?)
               ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`,

@@ -118,6 +118,12 @@ function renderInsights() {
   const nearbyBlock = nearby
     ? `<div class="near-head"><p class="kicker">WORTH A DETOUR NEARBY</p></div><div class="near-row">${nearby}</div>` : '';
 
+  const comps = d.comps;
+  const saleCards = (comps && comps.sales || []).map(s =>
+    `<div class="near-card sale-card"><div class="near-top"><strong>${money(s.price)}</strong><span class="chip">${fmtMonth(s.date)}</span></div><p>${s.label ? esc(s.label) + ' · ' : ''}${esc(s.type)}</p></div>`).join('');
+  const salesBlock = comps && comps.count
+    ? `<div class="near-head sales-head"><p class="kicker">RECENT SALES NEARBY</p><span class="sale-summary">${comps.count} similar sale${comps.count > 1 ? 's' : ''} in ${esc(comps.postcode)} since ${comps.since} · median ${money(comps.median)}</span></div><div class="near-row">${saleCards}</div>` : '';
+
   box.innerHTML = `
     <div class="insight-head">
       <p class="kicker">AREA INTELLIGENCE · ${(d.district ? d.district + ' · ' : '')}${p.area.toUpperCase()}</p>
@@ -128,8 +134,9 @@ function renderInsights() {
       <article class="insight-card">${scoreCard}</article>
       <article class="insight-card">${signalCard}</article>
     </div>
+    ${salesBlock}
     ${nearbyBlock}
-    <p class="insight-foot">Live data — ${(d.sources || []).join(', ') || 'sources unavailable'}. Scores are derived indicators, not financial advice. As of ${asOf(d.computedAt)}.</p>`;
+    <p class="insight-foot">Live data — ${(d.sources || []).join(', ') || 'sources unavailable'}. Prices are actual sold prices (Land Registry); scores are derived indicators, not financial advice. As of ${asOf(d.computedAt)}.</p>`;
 }
 
 // ---- data ----------------------------------------------------------------
