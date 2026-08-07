@@ -84,9 +84,10 @@ function headlineFor(p, d) {
 function compsChart(comps, asking) {
   const sales = (comps.sales || []).filter(s => s.price && s.date);
   if (!sales.length) return '';
+  const win = comps.windowYears || 5;
   const W = 660, H = 240, padL = 50, padR = 14, padT = 14, padB = 24;
   const yearMs = 365.25 * 864e5, now = Date.now();
-  const x0 = now - comps.windowYears * yearMs, x1 = now;
+  const x0 = now - win * yearMs, x1 = now;
   const xs = d => padL + (new Date(d).getTime() - x0) / (x1 - x0) * (W - padL - padR);
   const prices = sales.map(s => s.price).concat(asking ? [asking] : []);
   const step = 25000;
@@ -105,14 +106,14 @@ function compsChart(comps, asking) {
   const askEls = asking
     ? `<line class="cc-ask" x1="${padL}" x2="${W - padR}" y1="${ys(asking).toFixed(1)}" y2="${ys(asking).toFixed(1)}"/><text class="cc-asklab" x="${padL + 3}" y="${Math.max(ys(asking) - 6, padT + 9).toFixed(1)}">This home · ${money(asking)}</text>` : '';
   const dots = sales.map(s => `<circle class="cc-dot" cx="${xs(s.date).toFixed(1)}" cy="${ys(s.price).toFixed(1)}" r="4.5"><title>${money(s.price)} · ${fmtMonth(s.date)}${s.label ? ' · ' + esc(s.label) : ''}</title></circle>`).join('');
-  return `<svg viewBox="0 0 ${W} ${H}" class="comps-chart" role="img" aria-label="Comparable sold prices over the last ${comps.windowYears} years versus this home's asking price of ${money(asking)}; ${sales.length} sales plotted.">${grid}${ylab}${xlab}${askEls}${dots}</svg>`;
+  return `<svg viewBox="0 0 ${W} ${H}" class="comps-chart" role="img" aria-label="Comparable sold prices over the last ${win} years versus this home's asking price of ${money(asking)}; ${sales.length} sales plotted.">${grid}${ylab}${xlab}${askEls}${dots}</svg>`;
 }
 function compsRead(comps, asking) {
-  const n = comps.count, med = comps.median;
+  const n = comps.count, med = comps.median, win = comps.windowYears || 5;
   const liq = n >= 9 ? 'an active local resale market' : n >= 4 ? 'a steady resale market' : 'a thin market — few recent comparable sales, so a resale can take longer';
   let vs = 'about in line with';
   if (asking && med) { const pct = Math.round((asking / med - 1) * 100); if (Math.abs(pct) >= 2) vs = `${Math.abs(pct)}% ${pct > 0 ? 'above' : 'below'}`; }
-  return `Asking ${money(asking)} is ${vs} the ${comps.windowYears}-year median (${money(med)}) of ${n} comparable sale${n === 1 ? '' : 's'} — ${liq}.`;
+  return `Asking ${money(asking)} is ${vs} the ${win}-year median (${money(med)}) of ${n} comparable sale${n === 1 ? '' : 's'} — ${liq}.`;
 }
 function renderInsights() {
   const box = document.getElementById('areaInsights');
