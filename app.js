@@ -108,6 +108,22 @@ function compsChart(comps, asking) {
   const dots = sales.map(s => `<circle class="cc-dot" cx="${xs(s.date).toFixed(1)}" cy="${ys(s.price).toFixed(1)}" r="4.5"><title>${money(s.price)} · ${fmtMonth(s.date)}${s.label ? ' · ' + esc(s.label) : ''}</title></circle>`).join('');
   return `<svg viewBox="0 0 ${W} ${H}" class="comps-chart" role="img" aria-label="Comparable sold prices over the last ${win} years versus this home's asking price of ${money(asking)}; ${sales.length} sales plotted.">${grid}${ylab}${xlab}${askEls}${dots}</svg>`;
 }
+// Compact "market snapshot" stat card shown to the right of the comps chart.
+function compsSummary(comps, asking) {
+  const prices = (comps.sales || []).map(s => s.price).filter(Boolean);
+  const lo = Math.min(...prices), hi = Math.max(...prices), n = comps.count;
+  const pct = (asking && comps.median) ? Math.round((asking / comps.median - 1) * 100) : null;
+  const pctTxt = pct == null ? '—' : pct === 0 ? 'in line' : `${pct > 0 ? '+' : '−'}${Math.abs(pct)}%`;
+  const pctCls = pct == null ? '' : pct >= 5 ? 'prem' : pct <= -5 ? 'val' : '';
+  const liq = n >= 9 ? 'Active market' : n >= 4 ? 'Steady market' : 'Thin market';
+  const rows = [
+    ['Median (5 yr)', money(comps.median)],
+    ['This home', `${money(asking)} <i class="snap-pct ${pctCls}">${pctTxt}</i>`],
+    ['Sold range', `${compactGbp(lo)}–${compactGbp(hi)}`],
+    ['Activity', `${n} sale${n === 1 ? '' : 's'} · ${liq}`],
+  ];
+  return `<p class="ic-kicker">MARKET SNAPSHOT</p><div class="snap">${rows.map(([k, v]) => `<div class="snap-row"><span>${k}</span><b>${v}</b></div>`).join('')}</div>`;
+}
 function compsRead(comps, asking) {
   const n = comps.count, med = comps.median, win = comps.windowYears || 5;
   const liq = n >= 9 ? 'an active local resale market' : n >= 4 ? 'a steady resale market' : 'a thin market — few recent comparable sales, so a resale can take longer';
@@ -157,9 +173,14 @@ function renderInsights() {
     ? `<div class="near-head"><p class="kicker">WORTH A DETOUR NEARBY</p></div><div class="near-row">${nearby}</div>` : '';
 
   const comps = d.comps;
-  const salesBlock = comps && comps.count
-    ? `<div class="near-head sales-head"><p class="kicker">RECENT SALES NEARBY</p><span class="sale-summary">${comps.count} comparable sale${comps.count > 1 ? 's' : ''} in ${esc(comps.postcode)} · last ${comps.windowYears} yrs · median ${money(comps.median)}</span></div>
-       <div class="comps-panel">${compsChart(comps, p.price)}<p class="comps-read">${compsRead(comps, p.price)}</p></div>` : '';
+  const salesBlock = (comps && comps.count)
+    ? `<div class="near-head sales-head"><p class="kicker">RECENT SALES NEARBY</p><span class="sale-summary">${comps.count} comparable sale${comps.count > 1 ? 's' : ''} in ${esc(comps.postcode)} · last ${comps.windowYears || 5} yrs · median ${money(comps.median)}</span></div>
+       <div class="sales-grid">
+         <article class="insight-card comps-chart-card">${compsChart(comps, p.price)}<p class="comps-read">${compsRead(comps, p.price)}</p></article>
+         <article class="insight-card comps-summary-card">${compsSummary(comps, p.price)}</article>
+       </div>`
+    : `<div class="near-head sales-head"><p class="kicker">RECENT SALES NEARBY</p></div>
+       <div class="sales-grid"><article class="insight-card comps-none"><p class="ic-empty">No comparable sales recorded${d.postcode ? ' in ' + esc(d.postcode) : ' nearby'} in the last 5 years — common for new-builds and quiet streets. Recent Land Registry sales will appear here once similar homes sell.</p></article></div>`;
 
   box.innerHTML = `
     <div class="insight-head">

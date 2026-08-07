@@ -4,7 +4,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClient } from '@libsql/client';
-import { computeInsights } from './insights.mjs';
+import { computeInsights, recentSales } from './insights.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const port = Number(process.env.PORT || 5181);
@@ -20,7 +20,7 @@ const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 function extractMedia(html, listingUrl) {
   const id = (String(listingUrl).match(/(\d{5,})/) || [])[1]; // rightmove /properties/ID, OTM /details/ID
   if (!id) return { photos: [], floorplans: [], fetchedAt: new Date().toISOString() };
-  const rx = /https:\/\/media\.(?:rightmove\.co\.uk|onthemarket\.com)\/[^"'\\ )]+\.(?:jpe?g|png)/gi;
+  const rx = /https:\/\/media\.(?:rightmove\.co\.uk|onthemarket\.com)\/[^"'\\ )]+\.(?:jpe?g|png|gif|webp)/gi;
   // Scan the raw HTML AND a copy with escaped slashes (\/) unescaped, so floorplan/photo
   // URLs that only appear inside the page's JSON data are caught too.
   const all = [...new Set([...(html.match(rx) || []), ...(html.replace(/\\\//g, '/').match(rx) || [])])];
@@ -32,7 +32,7 @@ function extractMedia(html, listingUrl) {
     const groups = new Map();
     for (const u of urls) {
       const hash = (u.match(/([a-f0-9]{20,})/) || [u])[0];
-      const sized = u.match(/(?:_max_|[-_])(\d{2,4})x\d{2,4}\.(?:png|jpe?g)/i);
+      const sized = u.match(/(?:_max_|[-_])(\d{2,4})x\d{2,4}\.(?:png|jpe?g|gif|webp)/i);
       const rank = sized ? +sized[1] : 100000;   // full-res (no size suffix) wins
       const prev = groups.get(hash);
       if (!prev || rank > prev.rank) groups.set(hash, { u, rank });
@@ -630,8 +630,17 @@ async function refresh() {
         if (ex.listedDate) await db.execute({ sql: 'UPDATE properties SET listed_date=?, listed_reason=? WHERE id=?', args: [ex.listedDate, ex.listedReason, item.id] });
         // set-or-clear: a successful lookup with no comparable clears any stale value;
         // a network error throws above and leaves the existing value untouched.
-        const sold = await fetchSold(ex.postcode, ex.area, { price: item.price, flat: /flat|apartment|maison|studio/i.test(ex.type) });
+        const flat = /flat|apartment|maison|studio/i.test(ex.type);
+        const sold = await fetchSold(ex.postcode, ex.area, { price: item.price, flat });
         await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold ? sold.price : null, sold ? sold.date : null, sold ? (sold.exact ? 1 : 0) : null, item.id] });
+        // Refresh the "recent sales nearby" comps straight into the cached insights, so the
+        // re-check button surfaces them immediately (not only after the slow full recompute).
+        const row = (await db.execute({ sql: 'SELECT data FROM insights WHERE property_id=?', args: [item.id] })).rows[0];
+        if (row) {
+          const data = JSON.parse(row.data);
+          const comps = await recentSales(data.postcode || ex.postcode, item.price, flat);
+          if (comps) { data.comps = comps; await db.execute({ sql: 'UPDATE insights SET data=? WHERE property_id=?', args: [JSON.stringify(data), item.id] }); }
+        }
       } catch { }
       // Price-change tracking: record the previous price + when it changed.
       try {

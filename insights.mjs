@@ -161,7 +161,7 @@ async function flood(lat, lng) {
 }
 
 // --- 7. HM Land Registry Price Paid: recent comparable sales nearby -------
-async function recentSales(postcode, price, flat) {
+export async function recentSales(postcode, price, flat) {
   if (!postcode) return null;
   const d = await getJson(`https://landregistry.data.gov.uk/data/ppi/transaction-record.json?propertyAddress.postcode=${encodeURIComponent(postcode)}&_pageSize=100&_sort=-transactionDate`);
   const items = d.result?.items || []; // newest-first
