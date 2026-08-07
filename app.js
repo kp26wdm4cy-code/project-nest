@@ -28,6 +28,7 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&a
 const daysSince = iso => { const d = new Date(iso); return isNaN(d) ? null : Math.max(0, Math.round((Date.now() - d.getTime()) / 86400000)); };
 const fmtDate = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); };
 const fmtMonth = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }); };
+const compactGbp = n => n >= 1e6 ? '£' + (n / 1e6).toFixed(n % 1e6 ? 1 : 0) + 'm' : '£' + Math.round(n / 1000) + 'k';
 // Map pins + list dots are coloured by verdict: love=vivid green, view=light green,
 // watch=faint yellow, forget=grey, not-yet-reviewed=neutral.
 const markerClass = p => ({ Love: 'v-love', View: 'v-view', Watch: 'v-watch', Pass: 'v-pass' })[statusOf(p)] || 'v-queue';
@@ -77,6 +78,42 @@ function headlineFor(p, d) {
   return bits.length ? `${lead}: ${bits.join(', ')}.` : `${lead}: live area read below.`;
 }
 
+// Dot plot of comparable sold prices over time (last N years), with this home's asking
+// price as the baseline. One glance shows level (dots vs the line), trend (their slope)
+// and liquidity/resellability (how many dots there are). Native <title> gives per-dot hover.
+function compsChart(comps, asking) {
+  const sales = (comps.sales || []).filter(s => s.price && s.date);
+  if (!sales.length) return '';
+  const W = 660, H = 240, padL = 50, padR = 14, padT = 14, padB = 24;
+  const yearMs = 365.25 * 864e5, now = Date.now();
+  const x0 = now - comps.windowYears * yearMs, x1 = now;
+  const xs = d => padL + (new Date(d).getTime() - x0) / (x1 - x0) * (W - padL - padR);
+  const prices = sales.map(s => s.price).concat(asking ? [asking] : []);
+  const step = 25000;
+  const yMin = Math.floor(Math.min(...prices) * 0.96 / step) * step;
+  let yMax = Math.ceil(Math.max(...prices) * 1.04 / step) * step;
+  if (yMax <= yMin) yMax = yMin + step;
+  const ys = p => padT + (1 - (p - yMin) / (yMax - yMin)) * (H - padT - padB);
+  const yticks = [yMin, (yMin + yMax) / 2, yMax];
+  const grid = yticks.map(v => `<line class="cc-grid" x1="${padL}" x2="${W - padR}" y1="${ys(v).toFixed(1)}" y2="${ys(v).toFixed(1)}"/>`).join('');
+  const ylab = yticks.map(v => `<text class="cc-ylab" x="${padL - 8}" y="${(ys(v) + 3).toFixed(1)}" text-anchor="end">${compactGbp(v)}</text>`).join('');
+  let xlab = '';
+  for (let y = new Date(x0).getFullYear() + 1; y <= new Date(x1).getFullYear(); y++) {
+    const t = new Date(Date.UTC(y, 0, 1)).getTime();
+    if (t >= x0 && t <= x1) xlab += `<text class="cc-xlab" x="${xs(t).toFixed(1)}" y="${H - 7}" text-anchor="middle">${y}</text>`;
+  }
+  const askEls = asking
+    ? `<line class="cc-ask" x1="${padL}" x2="${W - padR}" y1="${ys(asking).toFixed(1)}" y2="${ys(asking).toFixed(1)}"/><text class="cc-asklab" x="${padL + 3}" y="${Math.max(ys(asking) - 6, padT + 9).toFixed(1)}">This home · ${money(asking)}</text>` : '';
+  const dots = sales.map(s => `<circle class="cc-dot" cx="${xs(s.date).toFixed(1)}" cy="${ys(s.price).toFixed(1)}" r="4.5"><title>${money(s.price)} · ${fmtMonth(s.date)}${s.label ? ' · ' + esc(s.label) : ''}</title></circle>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" class="comps-chart" role="img" aria-label="Comparable sold prices over the last ${comps.windowYears} years versus this home's asking price of ${money(asking)}; ${sales.length} sales plotted.">${grid}${ylab}${xlab}${askEls}${dots}</svg>`;
+}
+function compsRead(comps, asking) {
+  const n = comps.count, med = comps.median;
+  const liq = n >= 9 ? 'an active local resale market' : n >= 4 ? 'a steady resale market' : 'a thin market — few recent comparable sales, so a resale can take longer';
+  let vs = 'about in line with';
+  if (asking && med) { const pct = Math.round((asking / med - 1) * 100); if (Math.abs(pct) >= 2) vs = `${Math.abs(pct)}% ${pct > 0 ? 'above' : 'below'}`; }
+  return `Asking ${money(asking)} is ${vs} the ${comps.windowYears}-year median (${money(med)}) of ${n} comparable sale${n === 1 ? '' : 's'} — ${liq}.`;
+}
 function renderInsights() {
   const box = document.getElementById('areaInsights');
   if (!box) return;
@@ -119,10 +156,9 @@ function renderInsights() {
     ? `<div class="near-head"><p class="kicker">WORTH A DETOUR NEARBY</p></div><div class="near-row">${nearby}</div>` : '';
 
   const comps = d.comps;
-  const saleCards = (comps && comps.sales || []).map(s =>
-    `<div class="near-card sale-card"><div class="near-top"><strong>${money(s.price)}</strong><span class="chip">${fmtMonth(s.date)}</span></div><p>${s.label ? esc(s.label) + ' · ' : ''}${esc(s.type)}</p></div>`).join('');
   const salesBlock = comps && comps.count
-    ? `<div class="near-head sales-head"><p class="kicker">RECENT SALES NEARBY</p><span class="sale-summary">${comps.count} similar sale${comps.count > 1 ? 's' : ''} in ${esc(comps.postcode)} since ${comps.since} · median ${money(comps.median)}</span></div><div class="near-row">${saleCards}</div>` : '';
+    ? `<div class="near-head sales-head"><p class="kicker">RECENT SALES NEARBY</p><span class="sale-summary">${comps.count} comparable sale${comps.count > 1 ? 's' : ''} in ${esc(comps.postcode)} · last ${comps.windowYears} yrs · median ${money(comps.median)}</span></div>
+       <div class="comps-panel">${compsChart(comps, p.price)}<p class="comps-read">${compsRead(comps, p.price)}</p></div>` : '';
 
   box.innerHTML = `
     <div class="insight-head">

@@ -175,17 +175,21 @@ async function recentSales(postcode, price, flat) {
     const label = title([val(a.saon), val(a.paon)].filter(Boolean).join(', ') || val(a.street) || '');
     return { price: p, date: isNaN(dt.getTime()) ? null : dt.toISOString().slice(0, 10), type, uri, label };
   }).filter(r => r.price && r.date);
-  // "Similar": same property type (flat) and within a sensible band of the guide price.
+  // "Similar": same property type (flat), within a sensible band of the guide price,
+  // and — recency matters for pricing — only the last few years.
+  const WINDOW_YEARS = 5;
+  const cutoff = new Date(Date.now() - WINDOW_YEARS * 365.25 * 864e5).toISOString().slice(0, 10);
   const lo = price ? price * 0.5 : 0, hi = price ? price * 1.7 : Infinity;
-  let sim = rows.filter(r => r.price >= lo && r.price <= hi && (!flat || /flat|maison/.test(r.uri)));
-  if (!sim.length) sim = rows.filter(r => r.price >= lo && r.price <= hi);
+  const band = r => r.date >= cutoff && r.price >= lo && r.price <= hi;
+  let sim = rows.filter(r => band(r) && (!flat || /flat|maison/.test(r.uri)));
+  if (!sim.length) sim = rows.filter(band);
   if (!sim.length) return null;
   const sorted = sim.map(r => r.price).sort((a, b) => a - b);
   return {
-    postcode, count: sim.length,
+    postcode, windowYears: WINDOW_YEARS, count: sim.length,
     since: Math.min(...sim.map(r => +r.date.slice(0, 4))),
     median: sorted[Math.floor(sorted.length / 2)],
-    sales: sim.slice(0, 6).map(r => ({ price: r.price, date: r.date, type: r.type, label: r.label })),
+    sales: sim.slice(0, 40).map(r => ({ price: r.price, date: r.date, type: r.type, label: r.label })),
   };
 }
 
