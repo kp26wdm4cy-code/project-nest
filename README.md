@@ -10,6 +10,26 @@ photos/floor plans, commute times, price-drop alerts and a weekly email.
 
 ---
 
+## Signing in
+
+Nest is private — you sign in with a **magic link** (no password). Enter your email and,
+if it's on the allow-list, you get a one-time sign-in link by email (works once, expires
+in 20 minutes). Sessions last 30 days in a secure cookie.
+
+- **Who can get in:** only allow-listed emails. Ralf (`ralf.g.saade@gmail.com`) is seeded.
+  Add others (e.g. Hannah) in the app under **"People who can sign in"** — set the name to
+  match their past verdicts (e.g. "Hannah") so their history lines up.
+- **Your verdicts** are attributed to whoever is signed in (no more Ralf/Hannah toggle).
+- **Local dev without SendGrid:** the sign-in link is shown on screen so you can click
+  straight through — no email needed.
+- Sending links in production uses the same SendGrid sender as the weekly email
+  (`SENDGRID_API_KEY` / `SENDGRID_FROM`).
+
+Full design + what's next (per-household separation, Google sign-in): see
+[`docs/ACCOUNTS.md`](docs/ACCOUNTS.md).
+
+---
+
 ## Run it locally
 
 ```powershell

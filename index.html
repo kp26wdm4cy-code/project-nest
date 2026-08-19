@@ -19,18 +19,29 @@
         <button type="button" data-mode="buy">Buy <b></b></button>
         <button type="button" data-mode="rent">Rent <b></b></button>
       </div>
-      <div class="whoami">
-        <span>Reacting as</span>
-        <div class="switch" id="personSwitch" role="group" aria-label="Choose contributor">
-          <button type="button" data-person="Ralf">Ralf</button>
-          <button type="button" data-person="Hannah">Hannah</button>
-        </div>
+      <div class="whoami" id="userChip" hidden>
+        <span>Signed in as</span>
+        <b id="userName"></b>
+        <button type="button" id="logoutBtn" class="quiet-button">Log out</button>
       </div>
       <button id="briefButton" class="quiet-button">Your brief <span>→</span></button>
     </div>
   </header>
 
-  <main id="top">
+  <div id="loginScreen" class="login-screen" hidden>
+    <div class="login-card">
+      <div class="login-brand"><span>N</span> nest</div>
+      <h1>Ralf &amp; Hannah's home scout</h1>
+      <p>Sign in to see your shared shortlist. Enter your email and we'll send a one-time sign-in link — no password.</p>
+      <div class="login-row">
+        <input id="loginEmail" type="email" inputmode="email" placeholder="you@email.com" autocomplete="email" />
+        <button type="button" id="loginBtn" class="lead-btn">Send me a link</button>
+      </div>
+      <p id="loginStatus" class="login-status"></p>
+    </div>
+  </div>
+
+  <main id="top" hidden>
     <section class="intro">
       <div>
         <p class="kicker">YOUR SHARED SHORTLIST</p>
@@ -130,6 +141,17 @@
         <input id="destPostcode" type="text" placeholder="Postcode (e.g. EC2M 7PY)" />
         <button type="button" id="destAdd" class="lead-btn ghost">+ Add place</button>
       </div>
+    </section>
+
+    <section class="dest-bar" aria-label="Who can sign in">
+      <div class="dest-head"><strong>People who can sign in</strong><span>Only these emails can request a sign-in link. Add someone to give them access.</span></div>
+      <div id="allowChips" class="dest-chips"></div>
+      <div class="dest-add">
+        <input id="allowName" type="text" placeholder="Name (e.g. Hannah)" maxlength="40" />
+        <input id="allowEmail" type="email" placeholder="their@email.com" />
+        <button type="button" id="allowAdd" class="lead-btn ghost">+ Allow</button>
+      </div>
+      <p id="allowStatus" class="add-status"></p>
     </section>
 
     <section class="dest-bar" aria-label="Weekly email">

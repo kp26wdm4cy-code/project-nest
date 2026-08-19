@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { existsSync, mkdirSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { createClient } from '@libsql/client';
 import { computeInsights, recentSales } from './insights.mjs';
 
@@ -459,7 +460,10 @@ async function initialise() {
   );
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS commutes (property_id TEXT PRIMARY KEY, data TEXT NOT NULL, computed_at TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS guest_notes (property_id TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL);`);
+  CREATE TABLE IF NOT EXISTS guest_notes (property_id TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL, last_login TEXT);
+  CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS login_tokens (token TEXT PRIMARY KEY, email TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT);`);
   // Columns added over time — guarded so re-running is harmless.
   for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER',
     'listed_date TEXT', 'listed_reason TEXT', 'last_sold_price INTEGER', 'last_sold_date TEXT', 'last_sold_exact INTEGER',
@@ -468,6 +472,9 @@ async function initialise() {
   }
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
   if (!count) await seed();
+  // Seed the sign-in allow-list once (Ralf can add others from the app). Without an
+  // entry here nobody could bootstrap the first login.
+  if ((await getSetting('allowed_users', null)) == null) await setSetting('allowed_users', [{ email: 'ralf.g.saade@gmail.com', name: 'Ralf' }]);
 }
 async function getSetting(key, fallback) {
   try { const r = (await db.execute({ sql: 'SELECT value FROM settings WHERE key=?', args: [key] })).rows[0]; return r ? JSON.parse(r.value) : fallback; }
@@ -581,6 +588,55 @@ async function sendWeekly() {
     await new Promise(r => setTimeout(r, 300));
   }
   return { sent, newSug: newSug.length, drops: drops.length, errors };
+}
+
+// --- authentication: passwordless magic-link sign-in ----------------------
+// A user requests a link → we email a one-time token → clicking it creates a
+// server-side session (HttpOnly cookie). Only allow-listed emails can sign in.
+// Auth (who you are) is deliberately separate from the data model, so a second
+// method (e.g. Google) can be added later without touching sessions/authorization.
+const SESSION_DAYS = 30, LOGIN_TOKEN_MINUTES = 20;
+const nowISO = () => new Date().toISOString();
+const isoIn = ms => new Date(Date.now() + ms).toISOString();
+const normEmail = e => String(e || '').trim().toLowerCase();
+const validEmail = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e);
+async function getAllowed() { return (await getSetting('allowed_users', [])) || []; }
+async function allowedEntry(email) { const e = normEmail(email); return (await getAllowed()).find(u => normEmail(u.email) === e) || null; }
+function parseCookies(req) {
+  const out = {}, h = req.headers.cookie; if (!h) return out;
+  for (const part of h.split(';')) { const i = part.indexOf('='); if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); }
+  return out;
+}
+const isHttps = req => (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https' || !!req.socket.encrypted;
+const baseUrl = req => `${isHttps(req) ? 'https' : 'http'}://${req.headers.host}`;
+function setSessionCookie(res, req, token, maxAgeSec) {
+  const bits = [`nest_session=${token}`, 'HttpOnly', 'Path=/', 'SameSite=Lax', `Max-Age=${maxAgeSec}`];
+  if (isHttps(req)) bits.push('Secure');   // omit on localhost http so the cookie still sets in dev
+  res.setHeader('Set-Cookie', bits.join('; '));
+}
+async function currentUser(req) {
+  const tok = parseCookies(req).nest_session; if (!tok) return null;
+  const s = (await db.execute({ sql: 'SELECT user_id, expires_at FROM sessions WHERE token=?', args: [tok] })).rows[0];
+  if (!s || s.expires_at < nowISO()) return null;
+  return (await db.execute({ sql: 'SELECT id, email, name FROM users WHERE id=?', args: [s.user_id] })).rows[0] || null;
+}
+async function sendLoginEmail(req, email, token) {
+  const link = `${baseUrl(req)}/api/auth/callback?token=${token}`;
+  const key = process.env.SENDGRID_API_KEY, from = process.env.SENDGRID_FROM;
+  if (!key || !from) return { sent: false, link };   // dev: no email configured — caller surfaces the link
+  const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:460px;margin:auto;color:#17251f;padding:8px">
+    <h2 style="font-weight:600;margin:0 0 6px">Sign in to Nest</h2>
+    <p style="color:#556">Click below to sign in. The link works once and expires in ${LOGIN_TOKEN_MINUTES} minutes.</p>
+    <p style="margin:22px 0"><a href="${link}" style="background:#285b43;color:#fff;padding:12px 22px;text-decoration:none;border-radius:4px;display:inline-block">Sign in to Nest ↗</a></p>
+    <p style="color:#99a;font-size:12px">If you didn't request this, you can ignore it.</p></div>`;
+  try {
+    const r = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ personalizations: [{ to: [{ email }] }], from: { email: from, name: 'Nest' }, subject: 'Your Nest sign-in link', content: [{ type: 'text/html', value: html }] }),
+      signal: AbortSignal.timeout(15000),
+    });
+    return { sent: r.ok || r.status === 202, link };
+  } catch { return { sent: false, link }; }
 }
 
 async function seed() {
@@ -742,7 +798,61 @@ await initialise();
 
 createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(url.searchParams.get('person') || '')));
+
+  // --- auth routes (never gated) ------------------------------------------
+  if (url.pathname === '/api/auth/request' && req.method === 'POST') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    try {
+      const email = normEmail(JSON.parse(body || '{}').email);
+      if (!validEmail(email)) return send(res, 400, JSON.stringify({ error: 'Enter a valid email address.' }));
+      const entry = await allowedEntry(email);
+      let devLink = null;
+      if (entry) {
+        const token = randomBytes(24).toString('hex');
+        await db.execute({ sql: 'INSERT INTO login_tokens(token,email,created_at,expires_at) VALUES(?,?,?,?)', args: [token, email, nowISO(), isoIn(LOGIN_TOKEN_MINUTES * 60000)] });
+        const r = await sendLoginEmail(req, email, token);
+        if (!r.sent) devLink = r.link;   // no email configured (local dev) — surface the link
+      }
+      // Uniform response whether or not the email is allowed (no account enumeration).
+      return send(res, 200, JSON.stringify({ ok: true, ...(devLink ? { devLink } : {}) }));
+    } catch { return send(res, 400, JSON.stringify({ error: 'Could not process that.' })); }
+  }
+  if (url.pathname === '/api/auth/callback' && req.method === 'GET') {
+    const token = url.searchParams.get('token') || '';
+    const row = (await db.execute({ sql: 'SELECT email, expires_at, used_at FROM login_tokens WHERE token=?', args: [token] })).rows[0];
+    if (!row || row.used_at || row.expires_at < nowISO()) { res.writeHead(302, { Location: '/?auth=expired' }); return res.end(); }
+    await db.execute({ sql: 'UPDATE login_tokens SET used_at=? WHERE token=?', args: [nowISO(), token] });
+    const email = normEmail(row.email);
+    const entry = await allowedEntry(email);
+    if (!entry) { res.writeHead(302, { Location: '/?auth=denied' }); return res.end(); }
+    let u = (await db.execute({ sql: 'SELECT id FROM users WHERE email=?', args: [email] })).rows[0];
+    if (!u) { const id = 'u-' + randomBytes(8).toString('hex'); await db.execute({ sql: 'INSERT INTO users(id,email,name,created_at,last_login) VALUES(?,?,?,?,?)', args: [id, email, entry.name || email.split('@')[0], nowISO(), nowISO()] }); u = { id }; }
+    else await db.execute({ sql: 'UPDATE users SET last_login=? WHERE id=?', args: [nowISO(), u.id] });
+    const stoken = randomBytes(24).toString('hex');
+    await db.execute({ sql: 'INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)', args: [stoken, u.id, nowISO(), isoIn(SESSION_DAYS * 864e5)] });
+    setSessionCookie(res, req, stoken, SESSION_DAYS * 86400);
+    res.writeHead(302, { Location: '/' }); return res.end();
+  }
+  if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
+    const tok = parseCookies(req).nest_session; if (tok) await db.execute({ sql: 'DELETE FROM sessions WHERE token=?', args: [tok] });
+    setSessionCookie(res, req, '', 0);
+    return send(res, 200, JSON.stringify({ ok: true }));
+  }
+  if (url.pathname === '/api/me' && req.method === 'GET') {
+    const u = await currentUser(req);
+    return send(res, 200, JSON.stringify({ user: u ? { id: u.id, email: u.email, name: u.name } : null }));
+  }
+
+  // --- gate: every other /api route needs a signed-in user, except the two
+  //     cron-triggered jobs (they act on shared data with no private read-back).
+  const OPEN_API = new Set(['/api/discover', '/api/send-weekly']);
+  if (url.pathname.startsWith('/api/') && !OPEN_API.has(url.pathname)) {
+    const u = await currentUser(req);
+    if (!u) return send(res, 401, JSON.stringify({ error: 'Sign in required.' }));
+    req.user = u;
+  }
+
+  if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(req.user.name)));
   if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(), 'text/csv; charset=utf-8');
   if (url.pathname === '/api/refresh' && req.method === 'POST') return send(res, 200, JSON.stringify(await refresh()));
   if (url.pathname === '/api/discover' && req.method === 'POST') {
@@ -760,7 +870,7 @@ createServer(async (req, res) => {
     catch (e) { return send(res, 200, JSON.stringify({ updated: 0, error: String(e && e.message || e) })); }
   }
   if (url.pathname === '/api/settings' && req.method === 'GET')
-    return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []), briefs: await getBriefs() }));
+    return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []), briefs: await getBriefs(), allowedUsers: await getAllowed() }));
   if (url.pathname === '/api/settings' && req.method === 'PUT') {
     let body = ''; for await (const chunk of req) body += chunk;
     try {
@@ -787,7 +897,16 @@ createServer(async (req, res) => {
         }
         await setSetting('briefs', cur);
       }
-      return send(res, 200, JSON.stringify({ ok: true, searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []), briefs: await getBriefs() }));
+      if (Array.isArray(b.allowedUsers)) {
+        const clean = b.allowedUsers
+          .filter(u => u && validEmail(normEmail(u.email)))
+          .map(u => ({ email: normEmail(u.email), name: String(u.name || '').trim().slice(0, 40) || normEmail(u.email).split('@')[0] }));
+        // de-dupe by email; always keep the signed-in user so nobody can lock themselves out
+        const byEmail = new Map(clean.map(u => [u.email, u]));
+        if (req.user && !byEmail.has(normEmail(req.user.email))) byEmail.set(normEmail(req.user.email), { email: normEmail(req.user.email), name: req.user.name });
+        await setSetting('allowed_users', [...byEmail.values()].slice(0, 20));
+      }
+      return send(res, 200, JSON.stringify({ ok: true, searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []), briefs: await getBriefs(), allowedUsers: await getAllowed() }));
     } catch { return send(res, 400, JSON.stringify({ error: 'Invalid settings' })); }
   }
   if (url.pathname === '/api/properties' && req.method === 'POST') {
@@ -811,9 +930,9 @@ createServer(async (req, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
     try {
-      const { person, verdict, note } = JSON.parse(body);
-      if (!['Ralf', 'Hannah'].includes(person)) throw new Error('person');
+      const { verdict, note } = JSON.parse(body);
       if (!['Love', 'View', 'Watch', 'Pass', null].includes(verdict)) throw new Error('verdict');
+      const person = req.user.name;   // reactions are attributed to the signed-in user, never the client
       await db.execute({
         sql: `INSERT INTO feedback(property_id,person,verdict,note,updated_at) VALUES(?,?,?,?,?)
               ON CONFLICT(property_id,person) DO UPDATE SET verdict=excluded.verdict,note=excluded.note,updated_at=excluded.updated_at`,

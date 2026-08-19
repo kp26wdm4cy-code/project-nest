@@ -1,7 +1,43 @@
 # Accounts & logins — scoping
 
-Status: **not built.** This is the plan for turning Nest from one shared, open space
-into a multi-user app where people log in and keep their own data securely.
+Status: **Phase 1 (auth MVP) is BUILT and live (v3).** Nest now requires a magic-link
+sign-in; only allow-listed emails can get in. This doc keeps the full plan; the sections
+below note what's done vs. still to come.
+
+## What's built (v3 — magic-link auth MVP)
+
+- Passwordless **magic-link sign-in** via the existing SendGrid. Enter email → one-time
+  link (20-min expiry, single use) → server-side session in an `HttpOnly; Secure;
+  SameSite=Lax` cookie (30 days). Endpoints: `POST /api/auth/request`, `GET
+  /api/auth/callback`, `POST /api/auth/logout`, `GET /api/me`. In local dev (no SendGrid)
+  the link is returned in the response so you can click through.
+- **Allow-list** (`allowed_users` setting, seeded with Ralf) gates who can sign in —
+  managed in-app under "People who can sign in" (name + email). Adding someone = a
+  lightweight invite. Requests for non-allowed emails get a uniform response (no account
+  enumeration); the signed-in user can't remove themselves.
+- Tables `users`, `sessions`, `login_tokens`. Every `/api/*` route requires a session
+  **except** the two cron jobs (`/api/discover`, `/api/send-weekly`), which act on shared
+  data with no private read-back.
+- The old Ralf/Hannah localStorage toggle is gone — **your verdict is attributed to the
+  signed-in user** (set server-side, never client-supplied). The UI generalised from two
+  fixed people to "you + everyone else who reacted". Existing `feedback.person`
+  = 'Ralf'/'Hannah' still lines up because those users' names are Ralf/Hannah.
+- Data is still **one shared workspace** (everyone allow-listed sees the same shortlist).
+  The app is now private instead of open to the world.
+
+## Still to come (phases 2–3, NOT built)
+
+- **Per-household data separation** (workspaces + `workspace_id` scoping on every query) so
+  different couples get their own private shortlists — see the model + risks below.
+- **Email invitations** with links (today's allow-list is add-by-email, no invite email).
+- **Google sign-in** as a second method (planned for a later version; the auth layer is
+  kept separate from the data model so it slots in without touching sessions).
+- Roles, account management, delete-account, multi-workspace switching, and authenticated
+  per-workspace cron runs.
+
+---
+
+## Original plan (for reference / phases 2–3)
 
 ## Where we are today
 

@@ -14,23 +14,27 @@ const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 let allProperties = [];   // every home from the server (both buy and rent)
 let properties = [];      // current-mode slice — everything downstream reads this
 let selectedId = null;
+let currentUser = null;   // the signed-in user ({id,email,name}); ui.person = their name
 let map, markers = {};
 let galShots = [], galIndex = 0;  // current gallery images for the full-screen viewer
 let districtLayer = null, selectedDistricts = new Set(), areaMode = false, saveDistTimer;
 let destinations = [], subscribedEmails = [];
 let briefs = { buy: { maxPrice: 550000, minPrice: 120000, beds: [1, 2] }, rent: { maxPrice: 2500, minPrice: 800, beds: [1, 2] } };
+let allowedUsers = [];   // emails permitted to sign in ({email,name})
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
 // Rentals carry a monthly price; sales an outright price. One label formatter for both.
 const isRent = p => (p && p.listing_type) === 'rent';
 const priceLabel = p => isRent(p) ? `${money(p.price)} pcm` : money(p.price);
 const byId = id => properties.find(p => p.id === id);
-const partner = () => (ui.person === 'Ralf' ? 'Hannah' : 'Ralf');
-// Pass is a shared veto: if EITHER person has passed a home it counts as Passed for
-// both (out of the queue/keepers, hidden from the map). Otherwise it's this person's own
+// Pass is a shared veto: if ANYONE has passed a home it counts as Passed for everyone
+// (out of the queue/keepers, hidden from the map). Otherwise it's this person's own
 // verdict. Each person's reaction buttons still reflect their own choice (p.mine).
 const statusOf = p => (p.feedback || []).some(f => f.verdict === 'Pass') ? 'Pass' : (p.mine?.verdict || 'queue');
-const partnerVerdict = p => (p.feedback || []).find(f => f.person === partner() && f.verdict) || null;
+// Other signed-in people's verdicts on this home (everyone except you).
+const othersVerdicts = p => (p.feedback || []).filter(f => f.person !== ui.person && f.verdict);
+const othersInline = p => { const o = othersVerdicts(p); return o.length ? `${o[0].person}: ${verdictText(o[0].verdict)}${o.length > 1 ? ` +${o.length - 1}` : ''}` : ''; };
+const othersDetail = p => othersVerdicts(p).map(f => `${f.person} said ${verdictText(f.verdict)}${f.note ? `: “${f.note}”` : '.'}`).join(' ');
 const label = status => ({ queue: 'To review', Love: 'Keeper', View: 'Worth viewing', Watch: 'Watch', Pass: 'Passed' })[status] || status;
 const verdictText = v => ({ Love: '♥ Love it', View: '✓ Would view', Watch: '◌ Watch', Pass: '× Forget it' })[v] || v;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -311,12 +315,13 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; } catch { }
   renderModeChrome();
   updateAreaToggle();
   showDistricts();   // always render a faint shade for the selected areas
   renderDestChips();
   renderEmailChips();
+  renderAllowChips();
 }
 function renderDestChips() {
   const box = document.getElementById('destChips');
@@ -364,6 +369,30 @@ function addEmail() {
   if (!subscribedEmails.includes(v)) subscribedEmails.push(v);
   el.value = ''; renderEmailChips(); saveEmails('Subscribed — you’ll get a summary each Sunday morning.');
 }
+
+// ---- who can sign in (allow-list = lightweight invites) -------------------
+function renderAllowChips() {
+  const box = document.getElementById('allowChips');
+  if (!box) return;
+  box.innerHTML = allowedUsers.length
+    ? allowedUsers.map((u, i) => `<span class="dest-chip">${esc(u.name)} · ${esc(u.email)}<button data-i="${i}" aria-label="Remove ${esc(u.email)}">×</button></span>`).join('')
+    : '<span class="dest-empty">No one added yet.</span>';
+  box.querySelectorAll('button[data-i]').forEach(b => b.onclick = () => removeAllow(+b.dataset.i));
+}
+async function saveAllowed(msg) {
+  try { const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ allowedUsers }) })).json(); allowedUsers = s.allowedUsers || allowedUsers; renderAllowChips(); }
+  catch { }
+  const st = document.getElementById('allowStatus'); if (st && msg) st.textContent = msg;
+}
+function addAllow() {
+  const nEl = document.getElementById('allowName'), eEl = document.getElementById('allowEmail');
+  const name = (nEl.value || '').trim(), email = (eEl.value || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { eEl.focus(); return; }
+  if (!allowedUsers.some(u => u.email === email)) allowedUsers.push({ email, name: name || email.split('@')[0] });
+  nEl.value = ''; eEl.value = '';
+  renderAllowChips(); saveAllowed(`${name || email} can now sign in — send them the site link and they’ll get a magic link by email.`);
+}
+function removeAllow(i) { allowedUsers.splice(i, 1); renderAllowChips(); saveAllowed('Removed.'); }
 function districtStyle(name) {
   const on = selectedDistricts.has(name);
   if (!areaMode) return on ? { fill: true, fillColor: '#285b43', fillOpacity: 0.1, color: '#5d9b75', weight: 1, opacity: 0.5 } : { fill: false, stroke: false };
@@ -428,14 +457,14 @@ function renderList() {
   const list = properties.filter(p => included(p, ui.filter));
   const box = document.getElementById('propertyList');
   box.innerHTML = list.length ? list.map(p => {
-    const pv = partnerVerdict(p);
+    const others = othersInline(p);
     const av = availInfo(p);
     return `<button class="property-item ${p.id === selectedId ? 'active' : ''} ${p.recommendation === 'View' ? 'top' : ''}" data-id="${p.id}">
       <div class="item-top"><strong>${p.name}</strong><span class="fit">${p.recommendation === 'View' ? 'VIEW FIRST' : 'WATCH'}</span></div>
       <span>${p.area} · ${priceLabel(p)}${hasDrop(p) ? ` <i class="drop">${dropText(p)}</i>` : ''} · ${p.bedrooms} bed <i class="avail ${av.cls}">${av.text}</i>${availChip(p)}${(p.tags || []).includes('suggested') ? '<i class="sug">✨ Suggested</i>' : ''}</span>
-      <span><i class="status-dot ${markerClass(p)}"></i>${label(statusOf(p))}${pv ? ` · <b class="partner">${partner()}: ${verdictText(pv.verdict)}</b>` : ''}</span>
+      <span><i class="status-dot ${markerClass(p)}"></i>${label(statusOf(p))}${others ? ` · <b class="partner">${others}</b>` : ''}</span>
     </button>`;
-  }).join('') : '<p class="empty">Nothing here yet. Switch contributor or tab — verdicts are saved on the shared server.</p>';
+  }).join('') : '<p class="empty">Nothing here yet. Switch tab or add a home — verdicts are saved on the shared server.</p>';
   box.querySelectorAll('.property-item').forEach(b => b.onclick = () => select(b.dataset.id));
   renderCounts();
 }
@@ -478,7 +507,7 @@ function renderDetail() {
   const box = document.getElementById('propertyDetail');
   if (!p) { box.innerHTML = ''; return; }
   const mine = p.mine || {};
-  const pv = partnerVerdict(p);
+  const others = othersDetail(p);
   const av = availInfo(p);
   const med = p.media || {};
   const floors = med.floorplans || [], pics = med.photos || [];
@@ -511,7 +540,7 @@ function renderDetail() {
   <div class="reaction">
     <p class="kicker">SHARED VERDICT · YOU ARE ${ui.person.toUpperCase()}</p>
     <h3>What is your instinct?</h3>
-    <p>One tap is enough. Add a reason if you have one — it is saved for both of you.${pv ? ` <b class="partner">${partner()} said ${verdictText(pv.verdict)}${pv.note ? `: “${pv.note}”` : '.'}</b>` : ''}</p>
+    <p>One tap is enough. Add a reason if you have one — it is saved for everyone.${others ? ` <b class="partner">${others}</b>` : ''}</p>
     <div class="reaction-buttons">${['Love', 'View', 'Watch', 'Pass'].map(v => `<button data-verdict="${v}" class="${mine.verdict === v ? 'selected' : ''}">${verdictText(v)}</button>`).join('')}</div>
     <textarea id="note" placeholder="What works or puts you off? e.g. 'living room feels dark'">${mine.note || ''}</textarea>
     <div class="saved-note" id="savedNote">${mine.verdict || mine.note ? 'Saved on the shared server.' : ''}</div>
@@ -596,7 +625,7 @@ function renderLearning() {
   const passes = mine.filter(x => x.verdict === 'Pass').length;
   let html;
   if (!mine.length) {
-    html = '<h3>Your taste will become the filter.</h3><p>Give each lead a fast verdict as <strong>' + ui.person + '</strong> and, whenever you can, one sentence about why. Hannah and Ralf each keep their own verdicts on the same leads.</p>';
+    html = '<h3>Your taste will become the filter.</h3><p>Give each lead a fast verdict as <strong>' + ui.person + '</strong> and, whenever you can, one sentence about why. Everyone signed in keeps their own verdicts on the same leads.</p>';
   } else {
     html = `<h3>${loves ? `${loves} lead${loves > 1 ? 's' : ''} you want to keep in play.` : 'Your first decisions are taking shape.'}</h3>
       <p>${notes.length ? `You have left ${notes.length} note${notes.length > 1 ? 's' : ''} for the next scout.` : 'The next useful signal is why — light, layout, street, building or location.'}${passes ? ` ${passes} pass${passes > 1 ? 'es' : ''} help me avoid similar homes.` : ''}</p>`;
@@ -716,15 +745,42 @@ function renderLeadNote() {
   if (el) el.innerHTML = `<strong>${live} live lead${live === 1 ? '' : 's'}</strong><br><small>${last ? 'Availability ' + whenChecked(last) : 'Availability not checked yet — press “Check listings”.'}</small>`;
 }
 
-// ---- top-level actions ---------------------------------------------------
-function renderPersonSwitch() {
-  document.querySelectorAll('#personSwitch button').forEach(b => b.classList.toggle('active', b.dataset.person === ui.person));
+// ---- sign-in / identity --------------------------------------------------
+function renderUserChip() {
+  const chip = document.getElementById('userChip'), name = document.getElementById('userName');
+  if (name) name.textContent = currentUser ? currentUser.name : '';
+  if (chip) chip.hidden = !currentUser;
 }
-async function switchPerson(person) {
-  if (!PEOPLE.includes(person) || person === ui.person) return;
-  ui.person = person; saveUi(); renderPersonSwitch();
-  await loadProperties();
-  renderAll();
+async function logout() {
+  try { await fetch('/api/auth/logout', { method: 'POST' }); } catch { }
+  location.href = '/';
+}
+// Shown when there's no session: email → magic link. In local dev (no SendGrid) the
+// server returns the link directly so you can click through without email.
+function showLogin() {
+  const ls = document.getElementById('loginScreen'), main = document.getElementById('top');
+  if (main) main.hidden = true;
+  if (!ls) return;
+  ls.hidden = false;
+  const status = document.getElementById('loginStatus');
+  const params = new URLSearchParams(location.search);
+  if (params.get('auth') === 'expired') status.textContent = 'That sign-in link expired or was already used — enter your email for a fresh one.';
+  else if (params.get('auth') === 'denied') status.textContent = 'That email isn’t on the allow-list yet. Ask whoever set up Nest to add you.';
+  const btn = document.getElementById('loginBtn'), input = document.getElementById('loginEmail');
+  const submit = async () => {
+    const email = (input.value || '').trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { input.focus(); return; }
+    const orig = btn.textContent; btn.disabled = true; btn.textContent = 'Sending…';
+    try {
+      const r = await (await fetch('/api/auth/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) })).json();
+      if (r.devLink) status.innerHTML = `Dev mode (no email configured): <a href="${r.devLink}">click here to sign in</a>.`;
+      else status.textContent = 'Check your email for a sign-in link — it works once and expires in 20 minutes.';
+    } catch { status.textContent = 'Something went wrong — please try again.'; }
+    finally { btn.disabled = false; btn.textContent = orig; }
+  };
+  btn.onclick = submit;
+  input.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } };
+  input.focus();
 }
 
 async function checkListings(btn) {
@@ -828,7 +884,9 @@ function bind() {
   document.getElementById('briefEdit')?.addEventListener('click', () => { const ed = document.getElementById('briefEditor'); (ed && ed.hidden) ? openBriefEditor() : closeBriefEditor(); });
   document.getElementById('briefSave')?.addEventListener('click', saveBrief);
   document.getElementById('briefCancel')?.addEventListener('click', closeBriefEditor);
-  document.querySelectorAll('#personSwitch button').forEach(b => b.onclick = () => switchPerson(b.dataset.person));
+  document.getElementById('logoutBtn')?.addEventListener('click', logout);
+  document.getElementById('allowAdd')?.addEventListener('click', addAllow);
+  document.getElementById('allowEmail')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addAllow(); } });
   document.querySelectorAll('#modeSwitch button').forEach(b => b.onclick = () => switchMode(b.dataset.mode));
   document.getElementById('moveFrom')?.addEventListener('change', e => setMoveWindow('moveFrom', e.target.value));
   document.getElementById('moveTo')?.addEventListener('change', e => setMoveWindow('moveTo', e.target.value));
@@ -861,11 +919,18 @@ function bind() {
       else if (e.key === 'ArrowRight') lbStep(1);
     });
   }
-  renderPersonSwitch();
+  renderUserChip();
 }
 
 // ---- boot ----------------------------------------------------------------
 (async function boot() {
+  // Gate on a session first — no login, show the sign-in screen and stop.
+  const me = await fetch('/api/me', { cache: 'no-store' }).then(r => r.json()).catch(() => ({ user: null }));
+  if (!me.user) { showLogin(); return; }
+  currentUser = me.user; ui.person = currentUser.name; saveUi();
+  document.getElementById('loginScreen').hidden = true;
+  document.getElementById('top').hidden = false;
+  renderUserChip();
   // set the active tab class before first render
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   (document.querySelector(`.tab[data-filter="${ui.filter}"]`) || document.querySelector('.tab')).classList.add('active');
