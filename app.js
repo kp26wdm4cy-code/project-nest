@@ -2,12 +2,17 @@
 // Data lives in SQLite on the server; this file only reads and writes via /api.
 
 const PEOPLE = ['Ralf', 'Hannah'];
+const MODES = ['buy', 'rent'];
 const ui = JSON.parse(localStorage.getItem('nest-ui') || '{}');
 ui.person = PEOPLE.includes(ui.person) ? ui.person : 'Ralf';
 ui.filter ||= 'queue';
+ui.mode = MODES.includes(ui.mode) ? ui.mode : 'buy';   // Buy vs Rent — a top-level view switch
+ui.moveFrom ||= '';    // move-in window filter (ISO dates, '' = open)
+ui.moveTo ||= '';
 const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 
-let properties = [];      // latest server snapshot, for the current person
+let allProperties = [];   // every home from the server (both buy and rent)
+let properties = [];      // current-mode slice — everything downstream reads this
 let selectedId = null;
 let map, markers = {};
 let galShots = [], galIndex = 0;  // current gallery images for the full-screen viewer
@@ -15,6 +20,9 @@ let districtLayer = null, selectedDistricts = new Set(), areaMode = false, saveD
 let destinations = [], subscribedEmails = [];
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
+// Rentals carry a monthly price; sales an outright price. One label formatter for both.
+const isRent = p => (p && p.listing_type) === 'rent';
+const priceLabel = p => isRent(p) ? `${money(p.price)} pcm` : money(p.price);
 const byId = id => properties.find(p => p.id === id);
 const partner = () => (ui.person === 'Ralf' ? 'Hannah' : 'Ralf');
 // Pass is a shared veto: if EITHER person has passed a home it counts as Passed for
@@ -45,6 +53,26 @@ function whenChecked(iso) {
   return 'checked ' + d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) +
     ' · ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 }
+// Move-in availability: a listing's available-from date (mostly rentals).
+const todayISO = () => new Date().toISOString().slice(0, 10);
+function availWhen(p) {
+  const a = p.available_from;
+  if (!a) return null;
+  return a <= todayISO() ? 'Available now' : 'From ' + fmtDate(a);
+}
+const availChip = p => { const w = availWhen(p); return w ? `<i class="movein">🗓️ ${w}</i>` : ''; };
+// Move-in window filter: keep a home if its available-from date falls inside [from, to].
+// Homes with no stated date are kept (we can't judge them). Available-now counts as "today".
+function inMoveWindow(p) {
+  const from = ui.moveFrom, to = ui.moveTo;
+  if (!from && !to) return true;
+  const a = p.available_from;
+  if (!a) return true;
+  if (from && a < from) return false;   // free before the window opens — too soon
+  if (to && a > to) return false;       // not free until after it closes — too late
+  return true;
+}
+const moveFilterOn = () => !!(ui.moveFrom || ui.moveTo);
 
 // ---- area intelligence ---------------------------------------------------
 // Rendered from LIVE data computed server-side (HM Land Registry, OpenStreetMap,
@@ -173,7 +201,9 @@ function renderInsights() {
     ? `<div class="near-head"><p class="kicker">WORTH A DETOUR NEARBY</p></div><div class="near-row">${nearby}</div>` : '';
 
   const comps = d.comps;
-  const salesBlock = (comps && comps.count)
+  const salesBlock = isRent(p)   // sale comps don't apply to a rental — hide the whole block
+    ? ''
+    : (comps && comps.count)
     ? `<div class="near-head sales-head"><p class="kicker">RECENT SALES NEARBY</p><span class="sale-summary">${comps.count} comparable sale${comps.count > 1 ? 's' : ''} in ${esc(comps.postcode)} · last ${comps.windowYears || 5} yrs · median ${money(comps.median)}</span></div>
        <div class="sales-grid">
          <article class="insight-card comps-chart-card">${compsChart(comps, p.price)}<p class="comps-read">${compsRead(comps, p.price)}</p></article>
@@ -201,8 +231,29 @@ function renderInsights() {
 async function loadProperties() {
   const res = await fetch(`/api/properties?person=${encodeURIComponent(ui.person)}`, { cache: 'no-store' });
   if (!res.ok) throw new Error('Could not load properties');
-  properties = await res.json();
+  allProperties = await res.json();
+  applyMode();
+}
+// Slice the full list to the current Buy/Rent view; everything else reads `properties`.
+function applyMode() {
+  properties = allProperties.filter(p => (p.listing_type || 'buy') === ui.mode);
   if (!byId(selectedId)) selectedId = properties[0]?.id || null;
+}
+const modeCount = mode => allProperties.filter(p => (p.listing_type || 'buy') === mode).length;
+function renderModeSwitch() {
+  document.querySelectorAll('#modeSwitch button').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === ui.mode);
+    const c = b.querySelector('b'); if (c) c.textContent = modeCount(b.dataset.mode);
+  });
+}
+function switchMode(mode) {
+  if (!MODES.includes(mode) || mode === ui.mode) return;
+  ui.mode = mode; saveUi();
+  selectedId = null;
+  applyMode();
+  renderModeSwitch();
+  renderAll();
+  if (map) setTimeout(fitToProperties, 60);
 }
 
 async function saveFeedback(p, patch) {
@@ -232,7 +283,7 @@ function initMap() {
 function refreshMarkers() {
   Object.values(markers).forEach(m => map.removeLayer(m));
   markers = {};
-  const visible = properties.filter(p => statusOf(p) !== 'Pass'); // passed homes are hidden from the map
+  const visible = properties.filter(p => statusOf(p) !== 'Pass' && inMoveWindow(p)); // hide passed + out-of-window
   // Some homes only geocode to their postcode-district centre, so several can land on
   // the exact same point. Fan those out in a small ring so none hides behind another.
   const groups = {};
@@ -357,16 +408,19 @@ function updateAreaToggle() {
   b.classList.toggle('active', areaMode);
   b.innerHTML = areaMode ? `Done${n ? ' · <b>' + n + '</b> selected' : ' · tap districts'}` : `◧ Search areas${n ? ' · ' + n : ''}`;
 }
-function priceDrop(p) {
-  return (p.prev_price && p.price < p.prev_price) ? Math.round((p.prev_price - p.price) / 1000) : 0;
-}
+const hasDrop = p => p.prev_price && p.price < p.prev_price;
+// Short drop badge for the list; rentals move in £, sales in £k.
+const dropText = p => !hasDrop(p) ? '' : (isRent(p) ? `↓ ${money(p.prev_price - p.price)}` : `↓ £${Math.round((p.prev_price - p.price) / 1000)}k`);
+const prevLabel = p => isRent(p) ? `${money(p.prev_price)} pcm` : money(p.prev_price);
 
 // ---- lists ---------------------------------------------------------------
 function included(p, filter) {
   const s = statusOf(p);
+  if (filter === 'passed') return s === 'Pass';        // passed stays findable regardless of dates
+  if (!inMoveWindow(p)) return false;                  // move-in window narrows the active tabs
   if (filter === 'queue') return s === 'queue';
   if (filter === 'kept') return s === 'Love' || s === 'View' || s === 'Watch';
-  return s === 'Pass';
+  return false;
 }
 function renderList() {
   const list = properties.filter(p => included(p, ui.filter));
@@ -376,7 +430,7 @@ function renderList() {
     const av = availInfo(p);
     return `<button class="property-item ${p.id === selectedId ? 'active' : ''} ${p.recommendation === 'View' ? 'top' : ''}" data-id="${p.id}">
       <div class="item-top"><strong>${p.name}</strong><span class="fit">${p.recommendation === 'View' ? 'VIEW FIRST' : 'WATCH'}</span></div>
-      <span>${p.area} · ${money(p.price)}${priceDrop(p) ? ` <i class="drop">↓ £${priceDrop(p)}k</i>` : ''} · ${p.bedrooms} bed <i class="avail ${av.cls}">${av.text}</i>${(p.tags || []).includes('suggested') ? '<i class="sug">✨ Suggested</i>' : ''}</span>
+      <span>${p.area} · ${priceLabel(p)}${hasDrop(p) ? ` <i class="drop">${dropText(p)}</i>` : ''} · ${p.bedrooms} bed <i class="avail ${av.cls}">${av.text}</i>${availChip(p)}${(p.tags || []).includes('suggested') ? '<i class="sug">✨ Suggested</i>' : ''}</span>
       <span><i class="status-dot ${markerClass(p)}"></i>${label(statusOf(p))}${pv ? ` · <b class="partner">${partner()}: ${verdictText(pv.verdict)}</b>` : ''}</span>
     </button>`;
   }).join('') : '<p class="empty">Nothing here yet. Switch contributor or tab — verdicts are saved on the shared server.</p>';
@@ -409,7 +463,9 @@ function marketFacts(p) {
     if (p.listed_reason === 'reduced') bits.push(`<span>🏷️ Price reduced ${when}${days != null ? ` · ${days} day${days === 1 ? '' : 's'} ago` : ''}</span>`);
     else bits.push(`<span>🕒 Listed ${when}${days != null ? ` · ${days} day${days === 1 ? '' : 's'} on the market` : ''}</span>`);
   }
-  if (p.last_sold_price) {
+  const avail = availWhen(p);
+  if (avail) bits.push(`<span>🗓️ ${avail}${(moveFilterOn() && !inMoveWindow(p)) ? ' · outside your move-in window' : ''}</span>`);
+  if (!isRent(p) && p.last_sold_price) {   // last-sold price is a purchase concept
     const when = fmtMonth(p.last_sold_date);
     bits.push(`<span>💷 ${p.last_sold_exact ? 'Last sold' : 'Nearby sale (same postcode)'} ${money(p.last_sold_price)}${when ? ` · ${when}` : ''}</span>`);
   }
@@ -443,7 +499,7 @@ function renderDetail() {
         <button type="button" id="removeHome" class="remove-home">Remove home</button>
       </div>
     </div>
-    <p class="facts">${p.area} · ${money(p.price)}${priceDrop(p) ? ` <span class="drop big">↓ £${priceDrop(p)}k from ${money(p.prev_price)}</span>` : ''} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}${p.tenure ? ` · <span class="tenure${p.lease_years && p.lease_years < 90 ? ' short' : ''}">${p.tenure}${p.lease_years ? ` · ${p.lease_years}-yr lease` : ''}</span>` : ''}
+    <p class="facts">${p.area} · ${priceLabel(p)}${hasDrop(p) ? ` <span class="drop big">${dropText(p)} from ${prevLabel(p)}</span>` : ''} · ${p.bedrooms} bedrooms · ${p.size || 'Size TBC'}${(!isRent(p) && p.tenure) ? ` · <span class="tenure${p.lease_years && p.lease_years < 90 ? ' short' : ''}">${p.tenure}${p.lease_years ? ` · ${p.lease_years}-yr lease` : ''}</span>` : ''}
       <span class="avail ${av.cls} big">${av.text}</span><span class="checked">${whenChecked(p.last_checked)}</span></p>
     ${marketFacts(p)}
     <p class="agent-view">${p.agent_view}</p>
@@ -554,10 +610,14 @@ function renderBrief() {
   if (!homeEl && !areaEl) return;
   const keepers = properties.filter(p => ['Love', 'View', 'Watch'].includes(statusOf(p)));
   if (!keepers.length) { if (homeEl) homeEl.textContent = ''; if (areaEl) areaEl.textContent = ''; return; }
-  // price range
+  // price range (sales in £k; rentals in £ pcm)
   const prices = keepers.map(p => p.price).filter(n => n > 0).sort((a, b) => a - b);
   let priceStr = '';
-  if (prices.length) { const lo = Math.round(prices[0] / 1000), hi = Math.round(prices[prices.length - 1] / 1000); priceStr = lo === hi ? `£${lo}k` : `£${lo}k–£${hi}k`; }
+  if (prices.length) {
+    const lo = prices[0], hi = prices[prices.length - 1];
+    if (ui.mode === 'rent') priceStr = (lo === hi ? money(lo) : `${money(lo)}–${money(hi)}`) + ' pcm';
+    else { const l = Math.round(lo / 1000), h = Math.round(hi / 1000); priceStr = l === h ? `£${l}k` : `£${l}k–£${h}k`; }
+  }
   // bed mix (span + most common)
   const bedCounts = {};
   keepers.forEach(p => { if (p.bedrooms) bedCounts[p.bedrooms] = (bedCounts[p.bedrooms] || 0) + 1; });
@@ -571,6 +631,41 @@ function renderBrief() {
   keepers.forEach(p => { const o = ocOf(p.area); if (o) oc[o] = (oc[o] || 0) + 1; });
   const top = Object.keys(oc).sort((a, b) => oc[b] - oc[a]);
   if (areaEl) areaEl.textContent = top.length ? `Leaning toward ${top.slice(0, 5).join(', ')}${top.length > 5 ? ` +${top.length - 5} more` : ''}.` : '';
+}
+
+// Swap the static, mode-specific copy (brief ceiling, add-box placeholder) and disable
+// the sale-only "suggest homes" search while in Rent view.
+function renderModeChrome() {
+  const home = document.getElementById('briefHomeStatic');
+  if (home) home.textContent = ui.mode === 'rent'
+    ? '£2,000 pcm rough ceiling; stretch only if exceptional. 1–2 beds, sensible layout, minimal empty weeks before move-in.'
+    : '£450k target; £500k only if exceptional. 1–2 beds, 50m²+, efficient layout, charm and potential.';
+  const add = document.getElementById('addUrl');
+  if (add) add.placeholder = ui.mode === 'rent'
+    ? 'Paste a Rightmove/OnTheMarket “to rent” link to add a rental…'
+    : 'Paste a Rightmove or OnTheMarket link to add a home…';
+  const disc = document.getElementById('discoverBtn');
+  if (disc) { disc.disabled = ui.mode === 'rent'; disc.title = ui.mode === 'rent' ? 'Auto-suggest currently covers homes for sale only' : ''; }
+}
+// Reflect the move-in window filter (inputs, active state, how many homes it hides).
+function renderMoveFilter() {
+  const f = document.getElementById('moveFrom'), t = document.getElementById('moveTo'), clr = document.getElementById('moveClear'), note = document.getElementById('moveNote');
+  if (!f || !t) return;
+  f.value = ui.moveFrom || ''; t.value = ui.moveTo || '';
+  const on = moveFilterOn();
+  document.getElementById('moveFilter')?.classList.toggle('active', on);
+  if (clr) clr.hidden = !on;
+  if (note) {
+    if (!on) note.textContent = '';
+    else {
+      const hidden = properties.filter(p => statusOf(p) !== 'Pass' && !inMoveWindow(p)).length;
+      note.textContent = hidden ? `Hiding ${hidden} home${hidden === 1 ? '' : 's'} available outside this window.` : 'Every home falls inside this window.';
+    }
+  }
+}
+function setMoveWindow(which, val) {
+  ui[which] = val || ''; saveUi();
+  renderMoveFilter(); renderList(); refreshMarkers();
 }
 
 function renderLeadNote() {
@@ -620,10 +715,14 @@ async function submitAddUrl(btn) {
     if (!res.ok || data.error) { status.classList.add('err'); status.textContent = data.error || 'Could not add that link.'; }
     else {
       input.value = '';
-      status.textContent = data.existing ? `“${data.name}” is already on your list.` : `Added “${data.name}”. Photos are in; area data is filling in — press it again in a moment if the panel is still loading.`;
-      selectedId = data.id;
       ui.filter = 'queue'; saveUi();
       await loadProperties();
+      // Jump to whichever view (Buy/Rent) the new home lives in, so it's visible.
+      const added = allProperties.find(p => p.id === data.id);
+      if (added) { ui.mode = (added.listing_type || 'buy'); saveUi(); }
+      selectedId = data.id;
+      applyMode();
+      status.textContent = data.existing ? `“${data.name}” is already on your list.` : `Added “${data.name}” to your ${ui.mode === 'rent' ? 'Rent' : 'Buy'} list. Photos are in; area data is filling in — press it again in a moment if the panel is still loading.`;
       document.querySelector('.tab.active')?.classList.remove('active');
       document.querySelector('.tab[data-filter="queue"]')?.classList.add('active');
       renderAll();
@@ -672,6 +771,7 @@ function removeProperty(p) {
 }
 
 function renderAll() {
+  renderModeSwitch(); renderModeChrome(); renderMoveFilter();
   renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote();
 }
 
@@ -684,6 +784,10 @@ function bind() {
   });
   document.getElementById('briefButton').onclick = () => document.getElementById('brief').scrollIntoView({ behavior: 'smooth' });
   document.querySelectorAll('#personSwitch button').forEach(b => b.onclick = () => switchPerson(b.dataset.person));
+  document.querySelectorAll('#modeSwitch button').forEach(b => b.onclick = () => switchMode(b.dataset.mode));
+  document.getElementById('moveFrom')?.addEventListener('change', e => setMoveWindow('moveFrom', e.target.value));
+  document.getElementById('moveTo')?.addEventListener('change', e => setMoveWindow('moveTo', e.target.value));
+  document.getElementById('moveClear')?.addEventListener('click', () => { ui.moveFrom = ''; ui.moveTo = ''; saveUi(); renderMoveFilter(); renderList(); refreshMarkers(); });
   document.getElementById('checkListings').onclick = e => checkListings(e.currentTarget);
   const addBtn = document.getElementById('addBtn');
   if (addBtn) {

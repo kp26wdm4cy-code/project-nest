@@ -101,6 +101,32 @@ function extractSize(html) {
   if (rf) { const f = +rf[1]; if (f >= 100 && f <= 100000) return `${Math.round(f * 0.092903)} sq m`; }
   return null;
 }
+// Turn a human date ("15 December 2026", "15th Dec 2026", "now") into an ISO date.
+function parseHumanDate(s) {
+  const t = String(s || '').trim().replace(/(\d+)(?:st|nd|rd|th)/i, '$1');
+  if (/^(now|immediately|today)$/i.test(t)) return new Date().toISOString().slice(0, 10);
+  const d = new Date(t);
+  return (!isNaN(d.getTime()) && d.getFullYear() >= 2000 && d.getFullYear() < 2100) ? d.toISOString().slice(0, 10) : null;
+}
+// When a home is available to move into — mostly a rental concept ("Let available date"),
+// but sale listings sometimes state one too. Returns an ISO date, or null if not stated.
+function extractAvailable(html) {
+  // Rightmove's visible reel: <dt>Let available date: </dt><dd>Now</dd> or <dd>01/10/2026</dd>.
+  const reel = html.match(/Let available date:\s*<\/dt>\s*<dd>([^<]+)<\/dd>/i);
+  if (reel) {
+    const v = reel[1].trim();
+    if (/^(now|immediately|today|available)$/i.test(v)) return new Date().toISOString().slice(0, 10);
+    const dmy = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);   // DD/MM/YYYY (UK order)
+    if (dmy) return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+    const d = parseHumanDate(v); if (d) return d;
+  }
+  const j = html.match(/letAvailableDate\\?"\s*:\s*\\?"(\d{4}-\d{2}-\d{2})/i);
+  if (j) return j[1];
+  const m = html.match(/Available\s+(?:from\s+)?(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,}\s+\d{4})/i);
+  if (m) { const d = parseHumanDate(m[1]); if (d) return d; }
+  if (/\bavailable\s+(?:now|immediately)\b/i.test(html)) return new Date().toISOString().slice(0, 10);
+  return null;
+}
 // Last recorded sale from HM Land Registry Price Paid data (by postcode). If the listing
 // address carries a house/flat number we can match the exact unit; otherwise we return
 // the most recent sale in that postcode, flagged as not-exact so the UI can say so.
@@ -140,9 +166,20 @@ function extractListing(html, href) {
   const text = `${title} ${descr}`;               // title first — it usually has the price
   const beds = +((text.match(/(\d+)\s*bed/i) || [])[1] || 0) || null;
   const type = (text.match(/bedroom\s+([a-z][a-z-]*)\b/i) || [])[1] || (text.match(/\b(flat|maisonette|apartment|house|studio|bungalow|cottage|duplex)\b/i) || [])[1] || 'home';
+  // Buy vs rent: the OG title/description says "for rent"/"for sale", the price shows as
+  // "£X pcm", and the page's agent links carry transactionType=lettings. Rent prices are
+  // monthly (pcm) — stored in `price` and shown as £X pcm.
+  const rentSignal = /\b(?:to|for)\s+rent\b|property-to-rent|£[\d,]+\s*(?:pcm|per\s*month|pw|per\s*week)|transactionType=lettings/i;
+  const channel = (rentSignal.test(`${title} ${descr} ${href}`) || /transactionType=lettings|\\?"channel\\?"\s*:\s*\\?"RENT/i.test(html)) ? 'rent' : 'buy';
   let price = null;
-  const pm = text.match(/£\s?([\d,]{4,})/) || html.match(/primaryPrice"[^>]*><span>£([\d,]+)/) || html.match(/£\s?([\d,]{4,})/);
-  if (pm) price = +pm[1].replace(/,/g, '');
+  if (channel === 'rent') {
+    const rpm = text.match(/£\s?([\d,]+)\s*(?:pcm|per\s*month|pm\b)/i) || html.match(/primaryPrice"[^>]*><span>£([\d,]+)/) || text.match(/£\s?([\d,]{3,})/);
+    if (rpm) price = +rpm[1].replace(/,/g, '');
+    if (!price) { const pw = text.match(/£\s?([\d,]+)\s*(?:pw|per\s*week)/i); if (pw) price = Math.round(+pw[1].replace(/,/g, '') * 52 / 12); }
+  } else {
+    const pm = text.match(/£\s?([\d,]{4,})/) || html.match(/primaryPrice"[^>]*><span>£([\d,]+)/) || html.match(/£\s?([\d,]{4,})/);
+    if (pm) price = +pm[1].replace(/,/g, '');
+  }
   // Location comes from the listing's own OG text (title/description) — never a
   // whole-page scrape, which is full of postcode-shaped junk (CSS hashes etc).
   let area = (descr.match(/\bin\s+(.+?)\s+for\s+£/i) || [])[1]                 // "…in Bruce Road, E3 for £…"
@@ -186,7 +223,8 @@ function extractListing(html, href) {
   let listedDate = null, listedReason = null;
   const dm = html.match(/\b(Added|Reduced) on (\d{2})\/(\d{2})\/(\d{4})\b/i);
   if (dm) { listedReason = dm[1].toLowerCase(); listedDate = `${dm[4]}-${dm[3]}-${dm[2]}`; }
-  return { title, descr, beds, type, price, area, postcode, outcode, coords, media, tenure, leaseYears, size, listedDate, listedReason };
+  const availableFrom = extractAvailable(html);
+  return { title, descr, beds, type, price, area, postcode, outcode, coords, media, tenure, leaseYears, size, listedDate, listedReason, channel, availableFrom };
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function addListing(listingUrl, opts = {}) {
@@ -204,7 +242,7 @@ async function addListing(listingUrl, opts = {}) {
     try {
       await sleep(1200);
       const r2 = await fetch(u.href, { redirect: 'follow', headers: { 'User-Agent': BROWSER_UA, 'Accept': 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' }, signal: AbortSignal.timeout(20000) });
-      if (r2.ok) { const h2 = await r2.text(); const m2 = extractMedia(h2, u.href); if (m2.photos.length || m2.floorplans.length) ex.media = m2; if (!ex.size) { const s2 = extractSize(h2); if (s2) ex.size = s2; } }
+      if (r2.ok) { const h2 = await r2.text(); const m2 = extractMedia(h2, u.href); if (m2.photos.length || m2.floorplans.length) ex.media = m2; if (!ex.size) { const s2 = extractSize(h2); if (s2) ex.size = s2; } if (!ex.availableFrom) { const a2 = extractAvailable(h2); if (a2) ex.availableFrom = a2; } }
     } catch { }
   }
   let lat = ex.coords ? ex.coords.lat : null, lng = ex.coords ? ex.coords.lng : null, district = null;
@@ -222,22 +260,27 @@ async function addListing(listingUrl, opts = {}) {
   const agentView = opts.reason ? `✨ Suggested for you — ${opts.reason}.\n\n${desc}` : desc;
   const tags = [ex.type, ex.outcode, opts.reason ? 'suggested' : null].filter(Boolean).join('|');
   if (!exists) {
+    const rent = ex.channel === 'rent';
+    const checks = rent
+      ? 'Ask for: deposit and holding-deposit terms, minimum tenancy length, whether bills/council tax/parking are included, furnished or not, and pet/decor rules. Confirm the exact available-from date and any renewal terms.'
+      : 'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.';
     await db.execute({
-      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score,tenure,lease_years,listed_date,listed_reason)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score,tenure,lease_years,listed_date,listed_reason,listing_type,available_from)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       args: [id, name, areaLabel, ex.price, ex.beds || 0, ex.size || 'Size TBC', lat, lng, u.href, 'View', 'Medium', agentView,
-        'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.',
-        tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null, ex.tenure || null, ex.leaseYears || null, ex.listedDate || null, ex.listedReason || null],
+        checks, tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null, ex.tenure || null, ex.leaseYears || null, ex.listedDate || null, ex.listedReason || null,
+        ex.channel || 'buy', ex.availableFrom || null],
     });
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
     (async () => {
       try {
-        const data = await computeInsights({ latitude: lat, longitude: lng, price: ex.price, area: areaLabel, flat: /flat|apartment|maison|studio/i.test(ex.type) }, { tflKey });
+        const data = await computeInsights({ latitude: lat, longitude: lng, price: ex.price, area: areaLabel, flat: /flat|apartment|maison|studio/i.test(ex.type), rent }, { tflKey });
         await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), data.computedAt] });
       } catch { }
     })();
     (async () => { try { const dests = await getDestinations(); if (dests.length) await storeCommutes(id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { } })();
-    (async () => { try { const sold = await fetchSold(ex.postcode, ex.area, { price: ex.price, flat: /flat|apartment|maison|studio/i.test(ex.type) }); if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, id] }); } catch { } })();
+    // Last-sold price is a purchase concept — skip it for rentals.
+    if (!rent) (async () => { try { const sold = await fetchSold(ex.postcode, ex.area, { price: ex.price, flat: /flat|apartment|maison|studio/i.test(ex.type) }); if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, id] }); } catch { } })();
   }
   return { ok: true, id, name, existing: !!exists };
 }
@@ -397,7 +440,8 @@ async function initialise() {
   CREATE TABLE IF NOT EXISTS guest_notes (property_id TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL);`);
   // Columns added over time — guarded so re-running is harmless.
   for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER',
-    'listed_date TEXT', 'listed_reason TEXT', 'last_sold_price INTEGER', 'last_sold_date TEXT', 'last_sold_exact INTEGER']) {
+    'listed_date TEXT', 'listed_reason TEXT', 'last_sold_price INTEGER', 'last_sold_date TEXT', 'last_sold_exact INTEGER',
+    "listing_type TEXT NOT NULL DEFAULT 'buy'", 'available_from TEXT']) {
     try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
   }
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
@@ -571,11 +615,11 @@ async function bootstrapMedia() {
 // Compute live area intelligence for every property and cache it in the DB.
 // Sequential with a gap so we stay gentle on the shared public APIs (esp. Overpass).
 async function refreshInsights() {
-  const props = (await db.execute('SELECT id, name, area, price, latitude, longitude FROM properties')).rows;
+  const props = (await db.execute('SELECT id, name, area, price, latitude, longitude, listing_type FROM properties')).rows;
   const done = [];
   for (const p of props) {
     try {
-      const data = await computeInsights({ ...p, flat: /flat|apartment|maison|studio/i.test(p.name) }, { tflKey });
+      const data = await computeInsights({ ...p, flat: /flat|apartment|maison|studio/i.test(p.name), rent: p.listing_type === 'rent' }, { tflKey });
       await db.execute({
         sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?)
               ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`,
@@ -592,17 +636,17 @@ function send(res, code, body, type = 'application/json; charset=utf-8') { res.w
 function csv(value) { const text = value == null ? '' : String(value); return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
 
 async function exportCsv() {
-  const headings = ['Property', 'Area', 'Price', 'Bedrooms', 'Size', 'Tenure', 'Lease years', 'Listed', 'Last sold £', 'Last sold date', 'Recommendation', 'Confidence', 'Availability', 'Listing link', 'Latitude', 'Longitude', 'Last checked', 'Ralf verdict', 'Ralf note', 'Hannah verdict', 'Hannah note', 'Agent view', 'Checks'];
+  const headings = ['Property', 'Buy/Rent', 'Area', 'Price', 'Bedrooms', 'Size', 'Tenure', 'Lease years', 'Available from', 'Listed', 'Last sold £', 'Last sold date', 'Recommendation', 'Confidence', 'Availability', 'Listing link', 'Latitude', 'Longitude', 'Last checked', 'Ralf verdict', 'Ralf note', 'Hannah verdict', 'Hannah note', 'Agent view', 'Checks'];
   const all = await rows('');
   const lines = all.map(p => {
     const f = person => p.feedback.find(x => x.person.toLowerCase() === person.toLowerCase()) || {};
-    return [p.name, p.area, p.price, p.bedrooms, p.size, p.tenure, p.lease_years, p.listed_date, p.last_sold_price, p.last_sold_date, p.recommendation, p.confidence, p.availability, p.listing_url, p.latitude, p.longitude, p.last_checked, f('Ralf').verdict, f('Ralf').note, f('Hannah').verdict, f('Hannah').note, p.agent_view, p.checks].map(csv).join(',');
+    return [p.name, p.listing_type === 'rent' ? 'Rent' : 'Buy', p.area, p.price, p.bedrooms, p.size, p.tenure, p.lease_years, p.available_from, p.listed_date, p.last_sold_price, p.last_sold_date, p.recommendation, p.confidence, p.availability, p.listing_url, p.latitude, p.longitude, p.last_checked, f('Ralf').verdict, f('Ralf').note, f('Hannah').verdict, f('Hannah').note, p.agent_view, p.checks].map(csv).join(',');
   });
   return [headings.join(','), ...lines].join('\r\n');
 }
 
 async function refresh() {
-  const items = (await db.execute({ sql: 'SELECT id, listing_url, price, size FROM properties WHERE availability != ?', args: ['off-market'] })).rows;
+  const items = (await db.execute({ sql: 'SELECT id, listing_url, price, size, listing_type FROM properties WHERE availability != ?', args: ['off-market'] })).rows;
   const now = new Date().toISOString();
   const results = [];
   for (const item of items) {
@@ -624,22 +668,26 @@ async function refresh() {
           if (m) await db.execute({ sql: 'UPDATE properties SET size=? WHERE id=?', args: [`${m[1].replace(/,/g, '')} sq m`, item.id] });
         }
       } catch { }
-      // …and to backfill the listed date + last-sold price (HM Land Registry).
+      // …and to backfill the listed date, available-from, and last-sold price (Land Registry).
       try {
         const ex = extractListing(html, item.listing_url);
         if (ex.listedDate) await db.execute({ sql: 'UPDATE properties SET listed_date=?, listed_reason=? WHERE id=?', args: [ex.listedDate, ex.listedReason, item.id] });
-        // set-or-clear: a successful lookup with no comparable clears any stale value;
-        // a network error throws above and leaves the existing value untouched.
-        const flat = /flat|apartment|maison|studio/i.test(ex.type);
-        const sold = await fetchSold(ex.postcode, ex.area, { price: item.price, flat });
-        await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold ? sold.price : null, sold ? sold.date : null, sold ? (sold.exact ? 1 : 0) : null, item.id] });
-        // Refresh the "recent sales nearby" comps straight into the cached insights, so the
-        // re-check button surfaces them immediately (not only after the slow full recompute).
-        const row = (await db.execute({ sql: 'SELECT data FROM insights WHERE property_id=?', args: [item.id] })).rows[0];
-        if (row) {
-          const data = JSON.parse(row.data);
-          const comps = await recentSales(data.postcode || ex.postcode, item.price, flat);
-          if (comps) { data.comps = comps; await db.execute({ sql: 'UPDATE insights SET data=? WHERE property_id=?', args: [JSON.stringify(data), item.id] }); }
+        if (ex.availableFrom) await db.execute({ sql: 'UPDATE properties SET available_from=? WHERE id=?', args: [ex.availableFrom, item.id] });
+        // Last-sold + comparable sales are purchase concepts — skip them for rentals.
+        if (item.listing_type !== 'rent') {
+          // set-or-clear: a successful lookup with no comparable clears any stale value;
+          // a network error throws above and leaves the existing value untouched.
+          const flat = /flat|apartment|maison|studio/i.test(ex.type);
+          const sold = await fetchSold(ex.postcode, ex.area, { price: item.price, flat });
+          await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold ? sold.price : null, sold ? sold.date : null, sold ? (sold.exact ? 1 : 0) : null, item.id] });
+          // Refresh the "recent sales nearby" comps straight into the cached insights, so the
+          // re-check button surfaces them immediately (not only after the slow full recompute).
+          const row = (await db.execute({ sql: 'SELECT data FROM insights WHERE property_id=?', args: [item.id] })).rows[0];
+          if (row) {
+            const data = JSON.parse(row.data);
+            const comps = await recentSales(data.postcode || ex.postcode, item.price, flat);
+            if (comps) { data.comps = comps; await db.execute({ sql: 'UPDATE insights SET data=? WHERE property_id=?', args: [JSON.stringify(data), item.id] }); }
+          }
         }
       } catch { }
       // Price-change tracking: record the previous price + when it changed.

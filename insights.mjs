@@ -207,7 +207,7 @@ export async function computeInsights(property, opts = {}) {
     transport(lat, lng, opts.tflKey).catch(() => null),
     crime(lat, lng).catch(() => null),
     flood(lat, lng).catch(() => null),
-    (loc ? recentSales(loc.postcode, price, property.flat) : Promise.reject()).catch(() => null),
+    (loc && !property.rent ? recentSales(loc.postcode, price, property.flat) : Promise.reject()).catch(() => null),
   ]);
 
   if (pt) {
