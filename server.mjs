@@ -288,8 +288,17 @@ async function addListing(listingUrl, opts = {}) {
 // --- learn taste from verdicts, then discover matching Rightmove listings --
 const STOP = new Set('the a an and or for in on of to is it with this that you your are be from at as we i has have will can not but if so its their there here more into over near just also'.split(' '));
 const outcodesIn = s => (String(s).match(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/gi) || []).map(x => x.toUpperCase());
-async function buildTaste() {
-  const props = (await db.execute('SELECT id, price, area, tags, agent_view FROM properties')).rows;
+// The search brief per mode (editable in the app, stored in settings). maxPrice is the
+// hard ceiling (monthly for rent); minPrice drops teasers/shared-ownership fragments.
+const DEFAULT_BRIEF = { buy: { maxPrice: 550000, minPrice: 120000, beds: [1, 2] }, rent: { maxPrice: 2500, minPrice: 800, beds: [1, 2] } };
+async function getBriefs() {
+  const saved = await getSetting('briefs', null);
+  const out = { buy: { ...DEFAULT_BRIEF.buy }, rent: { ...DEFAULT_BRIEF.rent } };
+  if (saved && typeof saved === 'object') for (const m of ['buy', 'rent']) if (saved[m] && typeof saved[m] === 'object') out[m] = { ...out[m], ...saved[m] };
+  return out;
+}
+async function buildTaste(mode = 'buy') {
+  const props = (await db.execute({ sql: "SELECT id, price, area, tags, agent_view FROM properties WHERE COALESCE(listing_type,'buy')=?", args: [mode] })).rows;
   const fb = (await db.execute('SELECT property_id, verdict, note FROM feedback')).rows;
   const byId = new Map(props.map(p => [p.id, p]));
   const pos = [], neg = [];
@@ -341,15 +350,23 @@ function grabArray(src, marker) {
 function parseSearchResults(html) {
   const arr = grabArray(html, '"properties":[');
   if (!Array.isArray(arr)) return [];
-  return arr.map(p => ({
-    id: String(p.id),
-    price: p.price && p.price.amount,
-    beds: p.bedrooms,
-    type: p.propertySubType || 'home',
-    addr: p.displayAddress || '',
-    summary: p.summary || '',
-    outcode: (String(p.displayAddress || '').match(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g) || []).slice(-1)[0] || null,
-  })).filter(p => p.id && p.price);
+  return arr.map(p => {
+    // Rent results price by frequency (weekly/monthly/yearly) — normalise to a monthly
+    // figure so it's comparable to the brief. Sale results have no frequency.
+    const amt = p.price && p.price.amount, freq = p.price && p.price.frequency;
+    let price = amt;
+    if (freq === 'weekly') price = Math.round(amt * 52 / 12);
+    else if (freq === 'yearly' || freq === 'annually') price = Math.round(amt / 12);
+    return {
+      id: String(p.id),
+      price,
+      beds: p.bedrooms,
+      type: p.propertySubType || 'home',
+      addr: p.displayAddress || '',
+      summary: p.summary || '',
+      outcode: (String(p.displayAddress || '').match(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g) || []).slice(-1)[0] || null,
+    };
+  }).filter(p => p.id && p.price);
 }
 async function getSearchDistricts() {
   const d = await getSetting('search_districts', null);
@@ -357,10 +374,12 @@ async function getSearchDistricts() {
 }
 // Keep at most `cap` UNTOUCHED suggestions (auto-added, no verdict yet). Anything
 // the couple has reacted to, added by hand, or seeded is never touched.
-async function capSuggestions(cap) {
-  const rows = (await db.execute(`SELECT id FROM properties
-    WHERE tags LIKE '%suggested%' AND id NOT IN (SELECT property_id FROM feedback)
-    ORDER BY COALESCE(suggest_score,0) DESC`)).rows;
+async function capSuggestions(cap, mode = 'buy') {
+  const rows = (await db.execute({
+    sql: `SELECT id FROM properties
+    WHERE tags LIKE '%suggested%' AND COALESCE(listing_type,'buy')=? AND id NOT IN (SELECT property_id FROM feedback)
+    ORDER BY COALESCE(suggest_score,0) DESC`, args: [mode],
+  })).rows;
   const doomed = rows.slice(cap).map(r => r.id);
   for (const id of doomed) {
     for (const t of ['feedback', 'insights', 'media', 'commutes', 'guest_notes']) await db.execute({ sql: `DELETE FROM ${t} WHERE property_id=?`, args: [id] });
@@ -369,22 +388,25 @@ async function capSuggestions(cap) {
   return doomed.length;
 }
 async function discover(opts = {}) {
+  const mode = opts.mode === 'rent' ? 'rent' : 'buy';
   const max = opts.max || 4;            // how many new homes to add this run
-  const brief = { maxPrice: 550000, beds: [1, 2] };
-  const taste = await buildTaste();
+  const brief = (await getBriefs())[mode];
+  const minPrice = brief.minPrice || (mode === 'rent' ? 500 : 120000);
+  const taste = await buildTaste(mode);
   const areas = (await getSearchDistricts()).slice(0, opts.maxAreas || 5);
+  const searchPath = mode === 'rent' ? 'property-to-rent' : 'property-for-sale';
   const existing = new Set((await db.execute('SELECT listing_url FROM properties')).rows
     .map(r => (String(r.listing_url).match(/(\d{5,})/) || [])[1]).filter(Boolean));
   const seen = new Set(), candidates = [];
   for (const area of areas) {
     try {
-      const html = await (await fetch(`https://www.rightmove.co.uk/property-for-sale/${encodeURIComponent(area)}.html`,
+      const html = await (await fetch(`https://www.rightmove.co.uk/${searchPath}/${encodeURIComponent(area)}.html`,
         { headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html', 'Accept-Language': 'en-GB,en;q=0.9' }, signal: AbortSignal.timeout(20000) })).text();
       for (const c of parseSearchResults(html)) {
         if (existing.has(c.id) || seen.has(c.id)) continue;
         seen.add(c.id);
-        if (c.price > brief.maxPrice || c.price < 120000) continue;      // 120k floor drops shared-ownership teasers
-        if (c.beds && !brief.beds.includes(c.beds)) continue;
+        if (c.price > brief.maxPrice || c.price < minPrice) continue;    // floor drops shared-ownership / per-room teasers
+        if (c.beds != null && brief.beds.length && !brief.beds.includes(c.beds)) continue; // != null so a studio (0 beds) is filtered, unknown beds pass
         candidates.push(c);
       }
     } catch { }
@@ -401,8 +423,8 @@ async function discover(opts = {}) {
     if (r && r.ok && !r.existing) added.push({ name: r.name, why: t.why });
     await sleep(600);
   }
-  if (opts.poolCap) await capSuggestions(opts.poolCap);
-  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas };
+  if (opts.poolCap) await capSuggestions(opts.poolCap, mode);
+  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode };
 }
 
 // Database selection:
@@ -725,7 +747,8 @@ createServer(async (req, res) => {
   if (url.pathname === '/api/refresh' && req.method === 'POST') return send(res, 200, JSON.stringify(await refresh()));
   if (url.pathname === '/api/discover' && req.method === 'POST') {
     const scheduled = url.searchParams.get('scheduled') === '1';
-    try { return send(res, 200, JSON.stringify(await discover(scheduled ? { max: 8, poolCap: 20, maxAreas: 8 } : {}))); }
+    const mode = url.searchParams.get('mode') === 'rent' ? 'rent' : 'buy';
+    try { return send(res, 200, JSON.stringify(await discover(scheduled ? { max: 8, poolCap: 20, maxAreas: 8, mode } : { mode }))); }
     catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Search did not complete (Rightmove may be rate-limiting). Try again shortly.' })); }
   }
   if (url.pathname === '/api/send-weekly' && req.method === 'POST') {
@@ -737,7 +760,7 @@ createServer(async (req, res) => {
     catch (e) { return send(res, 200, JSON.stringify({ updated: 0, error: String(e && e.message || e) })); }
   }
   if (url.pathname === '/api/settings' && req.method === 'GET')
-    return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []) }));
+    return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []), briefs: await getBriefs() }));
   if (url.pathname === '/api/settings' && req.method === 'PUT') {
     let body = ''; for await (const chunk of req) body += chunk;
     try {
@@ -752,7 +775,19 @@ createServer(async (req, res) => {
         refreshCommutes().catch(() => {}); // recompute in the background
       }
       if (Array.isArray(b.emails)) await setSetting('emails', b.emails.filter(e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e))).map(e => String(e).toLowerCase()).slice(0, 6));
-      return send(res, 200, JSON.stringify({ ok: true, searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []) }));
+      if (b.briefs && typeof b.briefs === 'object') {
+        const cur = await getBriefs();
+        for (const m of ['buy', 'rent']) {
+          const src = b.briefs[m]; if (!src || typeof src !== 'object') continue;
+          const out = { ...cur[m] };
+          if (Number.isFinite(+src.maxPrice)) out.maxPrice = Math.min(m === 'rent' ? 100000 : 100000000, Math.max(0, Math.round(+src.maxPrice)));
+          if (Number.isFinite(+src.minPrice)) out.minPrice = Math.max(0, Math.round(+src.minPrice));
+          if (Array.isArray(src.beds)) out.beds = [...new Set(src.beds.map(Number).filter(n => n >= 0 && n <= 6))].sort((a, b) => a - b);
+          cur[m] = out;
+        }
+        await setSetting('briefs', cur);
+      }
+      return send(res, 200, JSON.stringify({ ok: true, searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []), briefs: await getBriefs() }));
     } catch { return send(res, 400, JSON.stringify({ error: 'Invalid settings' })); }
   }
   if (url.pathname === '/api/properties' && req.method === 'POST') {

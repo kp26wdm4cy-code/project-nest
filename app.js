@@ -18,6 +18,7 @@ let map, markers = {};
 let galShots = [], galIndex = 0;  // current gallery images for the full-screen viewer
 let districtLayer = null, selectedDistricts = new Set(), areaMode = false, saveDistTimer;
 let destinations = [], subscribedEmails = [];
+let briefs = { buy: { maxPrice: 550000, minPrice: 120000, beds: [1, 2] }, rent: { maxPrice: 2500, minPrice: 800, beds: [1, 2] } };
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
 // Rentals carry a monthly price; sales an outright price. One label formatter for both.
@@ -310,7 +311,8 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; } catch { }
+  renderModeChrome();
   updateAreaToggle();
   showDistricts();   // always render a faint shade for the selected areas
   renderDestChips();
@@ -633,19 +635,58 @@ function renderBrief() {
   if (areaEl) areaEl.textContent = top.length ? `Leaning toward ${top.slice(0, 5).join(', ')}${top.length > 5 ? ` +${top.length - 5} more` : ''}.` : '';
 }
 
-// Swap the static, mode-specific copy (brief ceiling, add-box placeholder) and disable
-// the sale-only "suggest homes" search while in Rent view.
+// ---- editable brief ------------------------------------------------------
+function bedsLabel(arr) {
+  if (!arr || !arr.length) return 'any number of beds';
+  const s = [...arr].sort((a, b) => a - b).map(n => n === 0 ? 'studio' : n + '-bed');
+  return s.length === 1 ? s[0] : s.slice(0, -1).join(', ') + ' or ' + s[s.length - 1];
+}
+const briefPriceLabel = (mode, v) => mode === 'rent' ? `${money(v)} pcm` : (v >= 1000 ? '£' + Math.round(v / 1000) + 'k' : money(v));
+function briefHomeText(mode) {
+  const b = briefs[mode] || {};
+  const tail = mode === 'rent' ? 'Sensible layout; minimal empty weeks before move-in.' : 'Efficient layout, charm and potential.';
+  return `Up to ${briefPriceLabel(mode, b.maxPrice)}, ${bedsLabel(b.beds)}. ${tail}`;
+}
+// Swap the mode-specific copy (brief ceiling from the editable brief, add-box placeholder,
+// suggest-button label). Auto-suggest now works for both Buy and Rent.
 function renderModeChrome() {
   const home = document.getElementById('briefHomeStatic');
-  if (home) home.textContent = ui.mode === 'rent'
-    ? '£2,000 pcm rough ceiling; stretch only if exceptional. 1–2 beds, sensible layout, minimal empty weeks before move-in.'
-    : '£450k target; £500k only if exceptional. 1–2 beds, 50m²+, efficient layout, charm and potential.';
+  if (home) home.textContent = briefHomeText(ui.mode);
   const add = document.getElementById('addUrl');
   if (add) add.placeholder = ui.mode === 'rent'
     ? 'Paste a Rightmove/OnTheMarket “to rent” link to add a rental…'
     : 'Paste a Rightmove or OnTheMarket link to add a home…';
   const disc = document.getElementById('discoverBtn');
-  if (disc) { disc.disabled = ui.mode === 'rent'; disc.title = ui.mode === 'rent' ? 'Auto-suggest currently covers homes for sale only' : ''; }
+  if (disc) { disc.disabled = false; disc.title = ''; disc.textContent = ui.mode === 'rent' ? '✨ Suggest rentals that fit us' : '✨ Suggest homes that fit us'; }
+}
+function openBriefEditor() {
+  const ed = document.getElementById('briefEditor'); if (!ed) return;
+  const b = briefs[ui.mode] || {};
+  document.getElementById('briefMaxPrice').value = b.maxPrice || '';
+  document.getElementById('briefPriceUnit').textContent = ui.mode === 'rent' ? 'monthly rent (pcm)' : 'price';
+  document.querySelectorAll('#briefBeds input').forEach(c => c.checked = (b.beds || []).includes(+c.value));
+  document.getElementById('briefEditStatus').textContent = '';
+  ed.hidden = false;
+  document.getElementById('briefEdit')?.setAttribute('aria-expanded', 'true');
+}
+function closeBriefEditor() {
+  const ed = document.getElementById('briefEditor'); if (ed) ed.hidden = true;
+  document.getElementById('briefEdit')?.setAttribute('aria-expanded', 'false');
+}
+async function saveBrief() {
+  const status = document.getElementById('briefEditStatus');
+  const maxPrice = Math.max(0, Math.round(+document.getElementById('briefMaxPrice').value || 0));
+  const beds = [...document.querySelectorAll('#briefBeds input:checked')].map(c => +c.value);
+  if (!maxPrice) { if (status) status.textContent = 'Enter a max ' + (ui.mode === 'rent' ? 'monthly rent.' : 'price.'); return; }
+  briefs[ui.mode] = { ...briefs[ui.mode], maxPrice, beds };
+  if (status) status.textContent = 'Saving…';
+  try {
+    const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ briefs }) })).json();
+    if (s.briefs) briefs = s.briefs;
+    renderModeChrome();
+    if (status) status.textContent = `Saved — “Suggest ${ui.mode === 'rent' ? 'rentals' : 'homes'}” will use this.`;
+    setTimeout(closeBriefEditor, 1100);
+  } catch { if (status) status.textContent = 'Could not save — is the server running?'; }
 }
 // Reflect the move-in window filter (inputs, active state, how many homes it hides).
 function renderMoveFilter() {
@@ -734,18 +775,19 @@ async function submitAddUrl(btn) {
 
 async function submitDiscover(btn) {
   const status = document.getElementById('addStatus');
+  const noun = ui.mode === 'rent' ? 'rentals' : 'homes to buy';
   const orig = btn.textContent;
   btn.disabled = true; btn.textContent = 'Searching Rightmove…';
   status.classList.remove('err');
-  status.textContent = 'Reading listings across your brief areas and ranking them by what you and Hannah have liked — this can take up to a minute…';
+  status.textContent = `Reading ${noun} across your brief areas and ranking them by what you and Hannah have liked — this can take up to a minute…`;
   try {
-    const res = await fetch('/api/discover', { method: 'POST' });
+    const res = await fetch(`/api/discover?mode=${encodeURIComponent(ui.mode)}`, { method: 'POST' });
     const data = await res.json();
     if (data.error) { status.classList.add('err'); status.textContent = data.error; }
     else if (!data.added || !data.added.length) {
-      status.textContent = `Looked at ${data.considered || 0} listings across your areas — nothing new beat what you already have. Try again in a day or two as fresh homes come on.`;
+      status.textContent = `Looked at ${data.considered || 0} ${noun} across your areas — nothing new beat what you already have. Try again in a day or two as fresh listings come on, or widen your brief.`;
     } else {
-      status.textContent = `Added ${data.added.length} suggestion${data.added.length > 1 ? 's' : ''}: ${data.added.map(a => '“' + a.name + '”').join(', ')} — look for the ✨ Suggested tag, and each explains why.`;
+      status.textContent = `Added ${data.added.length} ${ui.mode === 'rent' ? 'rental' : 'home'} suggestion${data.added.length > 1 ? 's' : ''}: ${data.added.map(a => '“' + a.name + '”').join(', ')} — look for the ✨ Suggested tag, and each explains why.`;
       ui.filter = 'queue'; saveUi();
       await loadProperties();
       document.querySelector('.tab.active')?.classList.remove('active');
@@ -783,6 +825,9 @@ function bind() {
     renderList();
   });
   document.getElementById('briefButton').onclick = () => document.getElementById('brief').scrollIntoView({ behavior: 'smooth' });
+  document.getElementById('briefEdit')?.addEventListener('click', () => { const ed = document.getElementById('briefEditor'); (ed && ed.hidden) ? openBriefEditor() : closeBriefEditor(); });
+  document.getElementById('briefSave')?.addEventListener('click', saveBrief);
+  document.getElementById('briefCancel')?.addEventListener('click', closeBriefEditor);
   document.querySelectorAll('#personSwitch button').forEach(b => b.onclick = () => switchPerson(b.dataset.person));
   document.querySelectorAll('#modeSwitch button').forEach(b => b.onclick = () => switchMode(b.dataset.mode));
   document.getElementById('moveFrom')?.addEventListener('change', e => setMoveWindow('moveFrom', e.target.value));

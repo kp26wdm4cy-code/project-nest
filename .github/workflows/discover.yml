@@ -12,8 +12,13 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger scheduled discovery
+      - name: Trigger scheduled discovery (buy)
         run: |
-          echo "Asking Nest to discover new homes…"
-          curl -fsS -X POST "https://project-nest-2mzu.onrender.com/api/discover?scheduled=1" \
-            --max-time 300 --retry 2 || echo "Trigger failed (Render may have been slow to wake) — will try again tomorrow."
+          echo "Asking Nest to discover new homes to buy…"
+          curl -fsS -X POST "https://project-nest-2mzu.onrender.com/api/discover?scheduled=1&mode=buy" \
+            --max-time 300 --retry 2 || echo "Buy trigger failed (Render may have been slow to wake) — will try again tomorrow."
+      - name: Trigger scheduled discovery (rent)
+        run: |
+          echo "Asking Nest to discover new homes to rent…"
+          curl -fsS -X POST "https://project-nest-2mzu.onrender.com/api/discover?scheduled=1&mode=rent" \
+            --max-time 300 --retry 2 || echo "Rent trigger failed (Render may have been slow to wake) — will try again tomorrow."
