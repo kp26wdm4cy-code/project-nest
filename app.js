@@ -419,14 +419,22 @@ function renderSpaceBox() {
     : '<span class="dest-empty">Just you so far.</span>';
   box.querySelectorAll('button[data-i]').forEach(b => b.onclick = () => removeSpacePerson(+b.dataset.i));
 }
-async function saveSpacePeople(msg) {
+async function saveSpacePeople(opts = {}) {
+  let invited = 0;
   try {
     const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ spacePeople: spacePeople.map(p => ({ email: p.email, name: p.name })) }) })).json();
+    invited = s.invited || 0;
     if (s.space) { spacePeople = s.space.people || []; currentWorkspace = { id: s.space.id, name: s.space.name }; }
     if (s.allowedUsers) allowedUsers = s.allowedUsers;
     renderSpaceBox(); renderAllowChips(); renderUserChip();
   } catch { }
-  const st = document.getElementById('spaceStatus'); if (st && msg) st.textContent = msg;
+  const st = document.getElementById('spaceStatus');
+  if (st) {
+    if (opts.removed) st.textContent = 'Removed from this space.';
+    else if (opts.addedName) st.textContent = invited
+      ? `Invited ${opts.addedName} — we’ve emailed them a link to join this space.`
+      : `Added ${opts.addedName}. They can sign in with this email to join (set up email to auto-send invites).`;
+  }
 }
 function addSpacePerson() {
   const nEl = document.getElementById('spacePersonName'), eEl = document.getElementById('spacePersonEmail');
@@ -434,9 +442,9 @@ function addSpacePerson() {
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { eEl.focus(); return; }
   if (!spacePeople.some(p => p.email.toLowerCase() === email)) spacePeople.push({ email, name: name || email.split('@')[0], joined: false });
   nEl.value = ''; eEl.value = '';
-  renderSpaceBox(); saveSpacePeople(`${name || email} can now open this space — send them the site link to sign in.`);
+  renderSpaceBox(); saveSpacePeople({ addedName: name || email });
 }
-function removeSpacePerson(i) { spacePeople.splice(i, 1); renderSpaceBox(); saveSpacePeople('Removed from this space.'); }
+function removeSpacePerson(i) { spacePeople.splice(i, 1); renderSpaceBox(); saveSpacePeople({ removed: true }); }
 async function renameSpace() {
   const el = document.getElementById('spaceNameInput'); const v = (el.value || '').trim();
   if (!v || (currentWorkspace && v === currentWorkspace.name)) return;

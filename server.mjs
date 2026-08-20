@@ -555,6 +555,7 @@ async function reconcileSpacePeople(wsId, actor, desired) {
   for (const inv of invites) { const e = normEmail(inv.email); if (!want.has(e)) await db.execute({ sql: 'DELETE FROM invites WHERE workspace_id=? AND email=?', args: [wsId, e] }); }
   const memberEmails = new Set(members.map(m => normEmail(m.email)));
   const inviteEmails = new Set(invites.map(i => normEmail(i.email)));
+  const added = [];   // people newly brought into the space this call (to email an invite)
   for (const p of byEmail.values()) {
     // The invite itself grants sign-in (signInIdentity checks invites) — no need to touch
     // the host's global allow-list.
@@ -563,7 +564,9 @@ async function reconcileSpacePeople(wsId, actor, desired) {
     const settled = existing && (await db.execute({ sql: 'SELECT 1 FROM memberships WHERE user_id=? LIMIT 1', args: [existing.id] })).rows[0];
     if (existing && !settled) await db.execute({ sql: 'INSERT OR IGNORE INTO memberships(workspace_id,user_id,role,created_at) VALUES(?,?,?,?)', args: [wsId, existing.id, 'member', nowISO()] });
     else await db.execute({ sql: 'INSERT OR IGNORE INTO invites(workspace_id,email,name,role,created_at) VALUES(?,?,?,?,?)', args: [wsId, p.email, p.name, 'member', nowISO()] });
+    added.push(p);
   }
+  return added;
 }
 async function getSetting(key, fallback) {
   try { const r = (await db.execute({ sql: 'SELECT value FROM settings WHERE key=?', args: [key] })).rows[0]; return r ? JSON.parse(r.value) : fallback; }
@@ -703,6 +706,30 @@ const nowISO = () => new Date().toISOString();
 const isoIn = ms => new Date(Date.now() + ms).toISOString();
 const normEmail = e => String(e || '').trim().toLowerCase();
 const validEmail = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e);
+const escHtml = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const INVITE_TOKEN_DAYS = 14;
+// Email someone you've added to a space: a one-click sign-in link (valid 14 days) that
+// drops them straight into the shared space (they have a pending invite/membership).
+async function sendInviteEmail(req, toEmail, inviterName, spaceName) {
+  const token = randomBytes(24).toString('hex');
+  await db.execute({ sql: 'INSERT INTO login_tokens(token,email,created_at,expires_at) VALUES(?,?,?,?)', args: [token, normEmail(toEmail), nowISO(), isoIn(INVITE_TOKEN_DAYS * 864e5)] });
+  const link = `${baseUrl(req)}/api/auth/callback?token=${token}`;
+  const key = process.env.SENDGRID_API_KEY, from = process.env.SENDGRID_FROM;
+  if (!key || !from) return { sent: false, link };   // dev — no email configured
+  const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:auto;color:#17251f;padding:8px">
+    <h2 style="font-weight:600;margin:0 0 6px">You're invited to Nest</h2>
+    <p style="color:#556"><b>${escHtml(inviterName)}</b> invited you to <b>${escHtml(spaceName)}</b> — a shared home shortlist on Nest. Click below to open it; the link signs you straight in and works for 14 days.</p>
+    <p style="margin:22px 0"><a href="${link}" style="background:#285b43;color:#fff;padding:12px 22px;text-decoration:none;border-radius:4px;display:inline-block">Open the shared space ↗</a></p>
+    <p style="color:#99a;font-size:12px">If you weren't expecting this, you can ignore it. You can also sign in any time at ${escHtml(baseUrl(req))} with this email.</p></div>`;
+  try {
+    const r = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ personalizations: [{ to: [{ email: normEmail(toEmail) }] }], from: { email: from, name: 'Nest' }, subject: `${inviterName} invited you to “${spaceName}” on Nest`, content: [{ type: 'text/html', value: html }] }),
+      signal: AbortSignal.timeout(15000),
+    });
+    return { sent: r.ok || r.status === 202, link };
+  } catch { return { sent: false, link }; }
+}
 async function getAllowed() { return (await getSetting('allowed_users', [])) || []; }
 async function allowedEntry(email) { const e = normEmail(email); return (await getAllowed()).find(u => normEmail(u.email) === e) || null; }
 // Who may sign in: on the host's global allow-list, OR invited to some space, OR already a
@@ -1080,8 +1107,15 @@ createServer(async (req, res) => {
         await setSetting('allowed_users', [...byEmail.values()].slice(0, 50));
       }
       if (typeof b.spaceName === 'string' && b.spaceName.trim()) await db.execute({ sql: 'UPDATE workspaces SET name=? WHERE id=?', args: [b.spaceName.trim().slice(0, 60), ws] });
-      if (Array.isArray(b.spacePeople)) await reconcileSpacePeople(ws, req.user, b.spacePeople);
-      return send(res, 200, JSON.stringify({ ok: true, ...(await settingsPayload()) }));
+      let invited = 0;
+      if (Array.isArray(b.spacePeople)) {
+        const added = await reconcileSpacePeople(ws, req.user, b.spacePeople);
+        if (added.length) {
+          const spaceName = await workspaceName(ws);
+          for (const p of added) { try { const r = await sendInviteEmail(req, p.email, req.user.name, spaceName); if (r.sent) invited++; } catch { } }
+        }
+      }
+      return send(res, 200, JSON.stringify({ ok: true, invited, ...(await settingsPayload()) }));
     } catch { return send(res, 400, JSON.stringify({ error: 'Invalid settings' })); }
   }
   if (url.pathname === '/api/properties' && req.method === 'POST') {
