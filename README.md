@@ -25,7 +25,27 @@ in 20 minutes). Sessions last 30 days in a secure cookie.
 - Sending links in production uses the same SendGrid sender as the weekly email
   (`SENDGRID_API_KEY` / `SENDGRID_FROM`).
 
-Full design + what's next (per-household separation, Google sign-in): see
+### Optional: "Sign in with Google"
+
+The Google button appears **only when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are
+set** — otherwise magic-link is the only method and nothing else changes. Google users
+still have to be on the allow-list (their Google email must match an allowed entry).
+
+To turn it on, create an OAuth client in the Google Cloud Console (one-time):
+
+1. **console.cloud.google.com** → create/pick a project.
+2. **APIs & Services → OAuth consent screen** → External; add your email as a test user.
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID → Web
+   application.**
+4. **Authorized redirect URIs** — add both:
+   - `https://project-nest-2mzu.onrender.com/api/auth/google/callback` (live)
+   - `http://127.0.0.1:5181/api/auth/google/callback` (local dev, if you use it)
+5. Copy the **Client ID** and **Client secret** into Render env vars `GOOGLE_CLIENT_ID`
+   and `GOOGLE_CLIENT_SECRET`, then redeploy/restart.
+
+The redirect URI must match exactly. The button then shows automatically.
+
+Full design + what's next (per-household separation, email invites): see
 [`docs/ACCOUNTS.md`](docs/ACCOUNTS.md).
 
 ---

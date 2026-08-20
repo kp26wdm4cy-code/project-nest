@@ -25,13 +25,20 @@ below note what's done vs. still to come.
 - Data is still **one shared workspace** (everyone allow-listed sees the same shortlist).
   The app is now private instead of open to the world.
 
+## Also built (Google sign-in — optional second method)
+
+- **"Sign in with Google"** (OAuth Authorization Code). Endpoints `/api/auth/google` and
+  `/api/auth/google/callback`; `/api/auth/config` tells the login screen whether to show
+  the button. It resolves the Google email → the same allow-list → the same
+  `establishSession` used by magic-link, so both methods behave identically.
+- Off by default: the button only appears when `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`
+  are set. See the README for the one-time Google Cloud setup.
+
 ## Still to come (phases 2–3, NOT built)
 
 - **Per-household data separation** (workspaces + `workspace_id` scoping on every query) so
   different couples get their own private shortlists — see the model + risks below.
 - **Email invitations** with links (today's allow-list is add-by-email, no invite email).
-- **Google sign-in** as a second method (planned for a later version; the auth layer is
-  kept separate from the data model so it slots in without touching sessions).
 - Roles, account management, delete-account, multi-workspace switching, and authenticated
   per-workspace cron runs.
 

@@ -620,6 +620,22 @@ async function currentUser(req) {
   if (!s || s.expires_at < nowISO()) return null;
   return (await db.execute({ sql: 'SELECT id, email, name FROM users WHERE id=?', args: [s.user_id] })).rows[0] || null;
 }
+// Shared sign-in: given a verified email (from a magic link OR Google), check the
+// allow-list, upsert the user, create a session cookie and redirect into the app.
+// Returns after writing the response. Used by both auth methods so they behave identically.
+async function establishSession(req, res, email) {
+  const e = normEmail(email);
+  const entry = await allowedEntry(e);
+  if (!entry) { res.writeHead(302, { Location: '/?auth=denied' }); return res.end(); }
+  let u = (await db.execute({ sql: 'SELECT id FROM users WHERE email=?', args: [e] })).rows[0];
+  if (!u) { const id = 'u-' + randomBytes(8).toString('hex'); await db.execute({ sql: 'INSERT INTO users(id,email,name,created_at,last_login) VALUES(?,?,?,?,?)', args: [id, e, entry.name || e.split('@')[0], nowISO(), nowISO()] }); u = { id }; }
+  else await db.execute({ sql: 'UPDATE users SET last_login=? WHERE id=?', args: [nowISO(), u.id] });
+  const stoken = randomBytes(24).toString('hex');
+  await db.execute({ sql: 'INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)', args: [stoken, u.id, nowISO(), isoIn(SESSION_DAYS * 864e5)] });
+  setSessionCookie(res, req, stoken, SESSION_DAYS * 86400);
+  res.writeHead(302, { Location: '/' }); return res.end();
+}
+const googleEnabled = () => !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
 async function sendLoginEmail(req, email, token) {
   const link = `${baseUrl(req)}/api/auth/callback?token=${token}`;
   const key = process.env.SENDGRID_API_KEY, from = process.env.SENDGRID_FROM;
@@ -822,16 +838,38 @@ createServer(async (req, res) => {
     const row = (await db.execute({ sql: 'SELECT email, expires_at, used_at FROM login_tokens WHERE token=?', args: [token] })).rows[0];
     if (!row || row.used_at || row.expires_at < nowISO()) { res.writeHead(302, { Location: '/?auth=expired' }); return res.end(); }
     await db.execute({ sql: 'UPDATE login_tokens SET used_at=? WHERE token=?', args: [nowISO(), token] });
-    const email = normEmail(row.email);
-    const entry = await allowedEntry(email);
-    if (!entry) { res.writeHead(302, { Location: '/?auth=denied' }); return res.end(); }
-    let u = (await db.execute({ sql: 'SELECT id FROM users WHERE email=?', args: [email] })).rows[0];
-    if (!u) { const id = 'u-' + randomBytes(8).toString('hex'); await db.execute({ sql: 'INSERT INTO users(id,email,name,created_at,last_login) VALUES(?,?,?,?,?)', args: [id, email, entry.name || email.split('@')[0], nowISO(), nowISO()] }); u = { id }; }
-    else await db.execute({ sql: 'UPDATE users SET last_login=? WHERE id=?', args: [nowISO(), u.id] });
-    const stoken = randomBytes(24).toString('hex');
-    await db.execute({ sql: 'INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)', args: [stoken, u.id, nowISO(), isoIn(SESSION_DAYS * 864e5)] });
-    setSessionCookie(res, req, stoken, SESSION_DAYS * 86400);
-    res.writeHead(302, { Location: '/' }); return res.end();
+    return void await establishSession(req, res, row.email);
+  }
+  // Which sign-in methods are available (so the login screen can show the Google button).
+  if (url.pathname === '/api/auth/config' && req.method === 'GET') return send(res, 200, JSON.stringify({ google: googleEnabled() }));
+  // Google OAuth (Authorization Code). Only active when GOOGLE_CLIENT_ID/SECRET are set.
+  if (url.pathname === '/api/auth/google' && req.method === 'GET') {
+    if (!googleEnabled()) { res.writeHead(302, { Location: '/?auth=nogoogle' }); return res.end(); }
+    const state = randomBytes(16).toString('hex');
+    res.setHeader('Set-Cookie', `nest_oauth_state=${state}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600${isHttps(req) ? '; Secure' : ''}`);
+    const params = new URLSearchParams({
+      client_id: process.env.GOOGLE_CLIENT_ID, redirect_uri: `${baseUrl(req)}/api/auth/google/callback`,
+      response_type: 'code', scope: 'openid email profile', state, access_type: 'online', prompt: 'select_account',
+    });
+    res.writeHead(302, { Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}` }); return res.end();
+  }
+  if (url.pathname === '/api/auth/google/callback' && req.method === 'GET') {
+    if (!googleEnabled()) { res.writeHead(302, { Location: '/' }); return res.end(); }
+    const code = url.searchParams.get('code'), state = url.searchParams.get('state');
+    if (!code || !state || state !== parseCookies(req).nest_oauth_state) { res.writeHead(302, { Location: '/?auth=expired' }); return res.end(); }
+    try {
+      const tok = await (await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ code, client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET, redirect_uri: `${baseUrl(req)}/api/auth/google/callback`, grant_type: 'authorization_code' }),
+        signal: AbortSignal.timeout(15000),
+      })).json();
+      if (!tok.id_token) { res.writeHead(302, { Location: '/?auth=denied' }); return res.end(); }
+      // id_token comes straight from Google's token endpoint over TLS (authenticated with our
+      // client secret), so we can trust its claims without a separate JWKS signature check.
+      const payload = JSON.parse(Buffer.from(tok.id_token.split('.')[1], 'base64url').toString('utf8'));
+      if (!payload.email || payload.email_verified === false) { res.writeHead(302, { Location: '/?auth=denied' }); return res.end(); }
+      return void await establishSession(req, res, payload.email);
+    } catch { res.writeHead(302, { Location: '/?auth=expired' }); return res.end(); }
   }
   if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
     const tok = parseCookies(req).nest_session; if (tok) await db.execute({ sql: 'DELETE FROM sessions WHERE token=?', args: [tok] });

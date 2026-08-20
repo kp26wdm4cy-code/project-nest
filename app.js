@@ -766,6 +766,13 @@ function showLogin() {
   const params = new URLSearchParams(location.search);
   if (params.get('auth') === 'expired') status.textContent = 'That sign-in link expired or was already used — enter your email for a fresh one.';
   else if (params.get('auth') === 'denied') status.textContent = 'That email isn’t on the allow-list yet. Ask whoever set up Nest to add you.';
+  // Show the Google button only if the server has Google configured.
+  fetch('/api/auth/config').then(r => r.json()).then(cfg => {
+    if (!cfg.google) return;
+    const g = document.getElementById('googleBtn'), or = document.getElementById('loginOr');
+    if (or) or.hidden = false;
+    if (g) { g.hidden = false; g.onclick = () => { location.href = '/api/auth/google'; }; }
+  }).catch(() => { });
   const btn = document.getElementById('loginBtn'), input = document.getElementById('loginEmail');
   const submit = async () => {
     const email = (input.value || '').trim();
