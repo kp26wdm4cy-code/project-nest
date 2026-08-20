@@ -1050,16 +1050,17 @@ function renderCurate() {
   const headCells = ks.map((p, i) => `<th class="${i === topIdx ? 'cmp-top' : ''}"><button class="cmp-h" data-id="${p.id}"><span class="cmp-name">${esc(cmpShort(p))}</span><span class="cmp-price">${priceLabel(p)}</span></button></th>`).join('');
   const rowHtml = rows.map(r => {
     const nums = r.num ? ks.map((p, i) => r.num(p, i)) : null;
-    let best = -1, worst = -1;
+    const bestSet = new Set(), worstSet = new Set();
     if (nums) {
-      const present = nums.map((v, i) => [v, i]).filter(x => x[0] != null);
+      const present = nums.filter(v => v != null);
       if (present.length >= 2 && r.better) {
-        const sorted = present.slice().sort((a, b) => a[0] - b[0]);
-        best = (r.better === 'low' ? sorted[0] : sorted[sorted.length - 1])[1];
-        worst = (r.better === 'low' ? sorted[sorted.length - 1] : sorted[0])[1];
+        const bestVal = r.better === 'low' ? Math.min(...present) : Math.max(...present);
+        const worstVal = r.better === 'low' ? Math.max(...present) : Math.min(...present);
+        // Highlight EVERY cell tied for best; mark worst only when it's distinct from best.
+        nums.forEach((v, i) => { if (v == null) return; if (v === bestVal) bestSet.add(i); else if (v === worstVal && worstVal !== bestVal) worstSet.add(i); });
       }
     }
-    const cells = ks.map((p, i) => `<td class="${i === best ? 'cmp-best' : ''} ${i === worst ? 'cmp-worst' : ''} ${i === topIdx ? 'cmp-topcol' : ''}">${r.cell(p, i)}</td>`).join('');
+    const cells = ks.map((p, i) => `<td class="${bestSet.has(i) ? 'cmp-best' : ''} ${worstSet.has(i) ? 'cmp-worst' : ''} ${i === topIdx ? 'cmp-topcol' : ''}">${r.cell(p, i)}</td>`).join('');
     return `<tr class="${r.head ? 'cmp-fitrow' : ''}"><th scope="row">${r.label}</th>${cells}</tr>`;
   }).join('');
 
