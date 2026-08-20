@@ -50,6 +50,12 @@
   </div>
 
   <main id="top" hidden>
+    <nav class="page-nav" id="pageNav" aria-label="Pages">
+      <button type="button" data-page="explore" class="active">① Explore</button>
+      <button type="button" data-page="curate">② Curate &amp; track</button>
+    </nav>
+
+    <div id="pageExplore">
     <section class="intro">
       <div>
         <p class="kicker">YOUR SHARED SHORTLIST</p>
@@ -99,14 +105,6 @@
     </section>
 
     <section id="propertyDetail" class="property-detail" aria-live="polite"></section>
-
-    <section id="compareSection" class="compare-section" hidden>
-      <div class="compare-head">
-        <p class="kicker">COMPARE YOUR KEEPERS</p>
-        <button type="button" id="compareToggle" class="quiet-button"></button>
-      </div>
-      <div id="compareBody"></div>
-    </section>
 
     <section id="areaInsights" class="area-insights" aria-live="polite"></section>
 
@@ -197,6 +195,18 @@
       </div>
       <p id="emailStatus" class="add-status"></p>
     </section>
+    </div><!-- /#pageExplore -->
+
+    <div id="pageCurate" hidden>
+      <section class="curate">
+        <div class="curate-head">
+          <p class="kicker">CURATE &amp; TRACK</p>
+          <h1>Your keepers,<br>side by side <em>and on track.</em></h1>
+          <p class="subhead">The homes you're keeping — compared at a glance, plus where each one stands: contacted the agent, their details, viewing stage and notes. Edits save for both of you.</p>
+        </div>
+        <div id="curateBody"></div>
+      </section>
+    </div><!-- /#pageCurate -->
   </main>
 
   <div id="lightbox" class="lightbox" hidden>

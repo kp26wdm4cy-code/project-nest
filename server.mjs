@@ -482,7 +482,8 @@ async function initialise() {
   // Columns added over time — guarded so re-running is harmless.
   for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER',
     'listed_date TEXT', 'listed_reason TEXT', 'last_sold_price INTEGER', 'last_sold_date TEXT', 'last_sold_exact INTEGER',
-    "listing_type TEXT NOT NULL DEFAULT 'buy'", 'available_from TEXT', 'workspace_id TEXT']) {
+    "listing_type TEXT NOT NULL DEFAULT 'buy'", 'available_from TEXT', 'workspace_id TEXT',
+    'contacted INTEGER DEFAULT 0', 'agent_contact TEXT', 'track_stage TEXT', 'track_notes TEXT']) {
     try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
   }
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
@@ -1162,6 +1163,22 @@ createServer(async (req, res) => {
       });
       return send(res, 200, JSON.stringify({ ok: true }));
     } catch { return send(res, 400, JSON.stringify({ error: 'Invalid feedback' })); }
+  }
+  // Curate & track: per-home tracking (contacted the agent, agent contact, stage, notes).
+  const tr = url.pathname.match(/^\/api\/properties\/([^/]+)\/tracking$/);
+  if (tr && req.method === 'PUT') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    try {
+      const owned = (await db.execute({ sql: 'SELECT 1 FROM properties WHERE id=? AND workspace_id=?', args: [tr[1], req.wsId] })).rows[0];
+      if (!owned) return send(res, 404, JSON.stringify({ error: 'No such home.' }));
+      const b = JSON.parse(body || '{}'), sets = [], args = [];
+      if ('contacted' in b) { sets.push('contacted=?'); args.push(b.contacted ? 1 : 0); }
+      if ('agent_contact' in b) { sets.push('agent_contact=?'); args.push(String(b.agent_contact || '').slice(0, 200)); }
+      if ('track_stage' in b) { sets.push('track_stage=?'); args.push(String(b.track_stage || '').slice(0, 40)); }
+      if ('track_notes' in b) { sets.push('track_notes=?'); args.push(String(b.track_notes || '').slice(0, 600)); }
+      if (sets.length) { args.push(tr[1]); await db.execute({ sql: `UPDATE properties SET ${sets.join(', ')} WHERE id=?`, args }); }
+      return send(res, 200, JSON.stringify({ ok: true }));
+    } catch { return send(res, 400, JSON.stringify({ error: 'Could not save tracking.' })); }
   }
   // Guest notes — anyone can leave a named comment on a home (second opinions).
   const gn = url.pathname.match(/^\/api\/properties\/([^/]+)\/notes$/);

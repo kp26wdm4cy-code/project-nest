@@ -9,7 +9,7 @@ ui.filter ||= 'queue';
 ui.mode = MODES.includes(ui.mode) ? ui.mode : 'buy';   // Buy vs Rent — a top-level view switch
 ui.moveFrom ||= '';    // move-in window filter (ISO dates, '' = open)
 ui.moveTo ||= '';
-ui.compareOpen ??= false;   // smart keeper comparison panel open/closed
+ui.page = ['explore', 'curate'].includes(ui.page) ? ui.page : 'explore';  // Explore vs Curate & track
 ui.collapsed ||= {};        // collapsed state of the bottom settings blocks (default collapsed)
 const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 
@@ -1012,22 +1012,27 @@ function computeFit(keepers) {
     return Math.round(Math.max(0, Math.min(100, score)));
   });
 }
-function keepersForCompare() { return properties.filter(p => ['Love', 'View', 'Watch'].includes(statusOf(p))).slice(0, 6); }
-function renderCompare() {
-  const section = document.getElementById('compareSection'), body = document.getElementById('compareBody'), toggle = document.getElementById('compareToggle');
-  if (!section) return;
+function keepersForCompare() { return properties.filter(p => ['Love', 'View', 'Watch'].includes(statusOf(p))).slice(0, 8); }
+const STAGES = ['', 'To contact', 'Enquired', 'Viewing booked', 'Viewed', 'Offer made', 'Rejected'];
+async function saveTracking(id, patch) {
+  const p = byId(id) || allProperties.find(x => x.id === id);
+  if (p) Object.assign(p, patch);   // keep local copy in sync so re-renders don't lose it
+  try { await fetch(`/api/properties/${encodeURIComponent(id)}/tracking`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) }); } catch { }
+}
+// The Curate & track page: keepers side-by-side (compare metrics) plus editable tracking
+// rows (contacted the agent, their contact, stage, notes). Renders into #curateBody.
+function renderCurate() {
+  const body = document.getElementById('curateBody');
+  if (!body) return;
   const ks = keepersForCompare();
-  if (ks.length < 2) { section.hidden = true; if (body) body.innerHTML = ''; return; }
-  section.hidden = false;
-  if (toggle) toggle.textContent = ui.compareOpen ? 'Hide ▴' : `Compare ${ks.length} keepers ▾`;
-  if (!ui.compareOpen) { body.innerHTML = ''; return; }
+  if (!ks.length) { body.innerHTML = `<p class="curate-empty">No keepers yet. On the Explore page, react <b>♥ Love</b>, <b>✓ Would view</b> or <b>◌ Watch</b> to a home and it shows up here to compare and track.</p>`; return; }
 
-  const fit = computeFit(ks);
-  const topIdx = fit.indexOf(Math.max(...fit));
+  const fit = ks.length >= 2 ? computeFit(ks) : null;
+  const topIdx = fit ? fit.indexOf(Math.max(...fit)) : -1;
   const rent = ui.mode === 'rent';
   // rows: {label, cell(p)->html, num(p)->number|null, better:'low'|'high'|null}
   const rows = [
-    { label: 'Fit score', cell: (p, i) => `<b>${fit[i]}</b>`, num: (p, i) => fit[i], better: 'high', head: true },
+    ...(fit ? [{ label: 'Fit score', cell: (p, i) => `<b>${fit[i]}</b>`, num: (p, i) => fit[i], better: 'high', head: true }] : []),
     { label: rent ? 'Rent' : 'Price', cell: p => priceLabel(p), num: p => p.price, better: 'low' },
     { label: '£ / m²', cell: p => { const v = cmpPpsqm(p); return v ? '£' + v.toLocaleString('en-GB') : '—'; }, num: p => cmpPpsqm(p), better: 'low' },
     { label: 'Size', cell: p => { const v = cmpSqm(p); return v ? v + ' m²' : '—'; }, num: p => cmpSqm(p), better: 'high' },
@@ -1058,25 +1063,51 @@ function renderCompare() {
     return `<tr class="${r.head ? 'cmp-fitrow' : ''}"><th scope="row">${r.label}</th>${cells}</tr>`;
   }).join('');
 
-  // smart read
-  const byMin = (fn) => { let bi = -1, bv = Infinity; ks.forEach((p, i) => { const v = fn(p); if (v != null && v < bv) { bv = v; bi = i; } }); return bi; };
-  const byMax = (fn) => { let bi = -1, bv = -Infinity; ks.forEach((p, i) => { const v = fn(p); if (v != null && v > bv) { bv = v; bi = i; } }); return bi; };
-  const valueIdx = byMin(cmpPpsqm), connIdx = byMin(cmpCommute) >= 0 ? byMin(cmpCommute) : byMax(p => cmpScore(p, 'Transport')), roomIdx = byMax(cmpSqm);
-  const bits = [`<b>Best all-rounder:</b> ${esc(cmpShort(ks[topIdx]))} (fit ${fit[topIdx]})`];
-  if (valueIdx >= 0) bits.push(`<b>Best value:</b> ${esc(cmpShort(ks[valueIdx]))} (£${cmpPpsqm(ks[valueIdx]).toLocaleString('en-GB')}/m²)`);
-  if (connIdx >= 0) bits.push(`<b>Best connected:</b> ${esc(cmpShort(ks[connIdx]))}${cmpCommute(ks[connIdx]) != null ? ` (${cmpCommute(ks[connIdx])} min avg)` : ''}`);
-  if (roomIdx >= 0 && cmpSqm(ks[roomIdx])) bits.push(`<b>Roomiest:</b> ${esc(cmpShort(ks[roomIdx]))} (${cmpSqm(ks[roomIdx])} m²)`);
-  const tradeoff = (valueIdx >= 0 && valueIdx !== topIdx) ? ` <span class="cmp-trade">Trade-off: ${esc(cmpShort(ks[topIdx]))} scores highest overall, but ${esc(cmpShort(ks[valueIdx]))} is better value per m².</span>` : '';
+  // editable tracking rows (saved per home)
+  const track = [
+    { label: '📞 Contacted agent', input: p => `<input type="checkbox" class="trk" data-id="${p.id}" data-f="contacted" ${p.contacted ? 'checked' : ''} aria-label="Contacted the agent for ${esc(cmpShort(p))}" />` },
+    { label: 'Agent contact', input: p => `<input type="text" class="trk trk-txt" data-id="${p.id}" data-f="agent_contact" value="${esc(p.agent_contact || '')}" placeholder="name / phone / email" />` },
+    { label: 'Stage', input: p => `<select class="trk trk-sel" data-id="${p.id}" data-f="track_stage">${STAGES.map(s => `<option value="${esc(s)}" ${(p.track_stage || '') === s ? 'selected' : ''}>${s || '—'}</option>`).join('')}</select>` },
+    { label: 'Notes', input: p => `<input type="text" class="trk trk-txt" data-id="${p.id}" data-f="track_notes" value="${esc(p.track_notes || '')}" placeholder="notes…" />` },
+  ];
+  const trackHtml = track.map(r => `<tr class="trk-row"><th scope="row">${r.label}</th>${ks.map(p => `<td>${r.input(p)}</td>`).join('')}</tr>`).join('');
 
-  body.innerHTML = `<p class="cmp-read">${bits.join(' · ')}.${tradeoff}</p>
-    <div class="cmp-scroll"><table class="cmp-table"><thead><tr><th></th>${headCells}</tr></thead><tbody>${rowHtml}</tbody></table></div>
-    <p class="cmp-foot">Fit score weighs value-for-money, £/m², size, transport, green space, amenities, area value, commute and price-vs-local-market — plus a nudge when you both like it. Green = best in its row; a home you both like counts for more.</p>`;
-  body.querySelectorAll('.cmp-h').forEach(b => b.onclick = () => { select(b.dataset.id); document.getElementById('propertyDetail')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+  // smart read (needs at least two keepers to compare)
+  let readHtml = '';
+  if (fit) {
+    const byMin = (fn) => { let bi = -1, bv = Infinity; ks.forEach((p, i) => { const v = fn(p); if (v != null && v < bv) { bv = v; bi = i; } }); return bi; };
+    const byMax = (fn) => { let bi = -1, bv = -Infinity; ks.forEach((p, i) => { const v = fn(p); if (v != null && v > bv) { bv = v; bi = i; } }); return bi; };
+    const valueIdx = byMin(cmpPpsqm), connIdx = byMin(cmpCommute) >= 0 ? byMin(cmpCommute) : byMax(p => cmpScore(p, 'Transport')), roomIdx = byMax(cmpSqm);
+    const bits = [`<b>Best all-rounder:</b> ${esc(cmpShort(ks[topIdx]))} (fit ${fit[topIdx]})`];
+    if (valueIdx >= 0) bits.push(`<b>Best value:</b> ${esc(cmpShort(ks[valueIdx]))} (£${cmpPpsqm(ks[valueIdx]).toLocaleString('en-GB')}/m²)`);
+    if (connIdx >= 0) bits.push(`<b>Best connected:</b> ${esc(cmpShort(ks[connIdx]))}${cmpCommute(ks[connIdx]) != null ? ` (${cmpCommute(ks[connIdx])} min avg)` : ''}`);
+    if (roomIdx >= 0 && cmpSqm(ks[roomIdx])) bits.push(`<b>Roomiest:</b> ${esc(cmpShort(ks[roomIdx]))} (${cmpSqm(ks[roomIdx])} m²)`);
+    const tradeoff = (valueIdx >= 0 && valueIdx !== topIdx) ? ` <span class="cmp-trade">Trade-off: ${esc(cmpShort(ks[topIdx]))} scores highest overall, but ${esc(cmpShort(ks[valueIdx]))} is better value per m².</span>` : '';
+    readHtml = `<p class="cmp-read">${bits.join(' · ')}.${tradeoff}</p>`;
+  }
+
+  body.innerHTML = `${readHtml}
+    <div class="cmp-scroll"><table class="cmp-table"><thead><tr><th></th>${headCells}</tr></thead><tbody>${rowHtml}<tr class="trk-divider"><th scope="row">Tracking</th>${ks.map(() => '<td></td>').join('')}</tr>${trackHtml}</tbody></table></div>
+    <p class="cmp-foot">${fit ? 'Fit score weighs value-for-money, £/m², size, transport, green space, amenities, area value, commute and price-vs-local-market — plus a nudge when you both like it. Green = best in its row. ' : ''}Tracking (contacted, agent contact, stage, notes) saves for both of you.</p>`;
+  body.querySelectorAll('.cmp-h').forEach(b => b.onclick = () => { switchPage('explore'); select(b.dataset.id); document.getElementById('propertyDetail')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+  body.querySelectorAll('input.trk[type=checkbox]').forEach(el => el.onchange = () => saveTracking(el.dataset.id, { contacted: el.checked }));
+  body.querySelectorAll('.trk-txt, .trk-sel').forEach(el => el.onchange = () => saveTracking(el.dataset.id, { [el.dataset.f]: el.value }));
 }
 
 function renderAll() {
   renderModeSwitch(); renderModeChrome(); renderMoveFilter();
-  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote(); renderCompare();
+  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote(); renderCurate();
+}
+// Explore vs Curate & track pages.
+function switchPage(page) {
+  if (!['explore', 'curate'].includes(page)) return;
+  ui.page = page; saveUi();
+  document.getElementById('pageExplore').hidden = page !== 'explore';
+  document.getElementById('pageCurate').hidden = page !== 'curate';
+  document.querySelectorAll('#pageNav button').forEach(b => b.classList.toggle('active', b.dataset.page === page));
+  if (page === 'curate') renderCurate();
+  else if (map) setTimeout(() => { map.invalidateSize(); refreshMarkers(); }, 60);  // Leaflet needs this after being hidden
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 function bind() {
@@ -1110,7 +1141,7 @@ function bind() {
   if (discoverBtn) discoverBtn.onclick = () => submitDiscover(discoverBtn);
   document.getElementById('areaToggle')?.addEventListener('click', toggleAreas);
   document.getElementById('zoomExtent')?.addEventListener('click', fitToProperties);
-  document.getElementById('compareToggle')?.addEventListener('click', () => { ui.compareOpen = !ui.compareOpen; saveUi(); renderCompare(); });
+  document.querySelectorAll('#pageNav button').forEach(b => b.onclick = () => switchPage(b.dataset.page));
   initCollapsibles();
   document.getElementById('destAdd')?.addEventListener('click', addDest);
   document.getElementById('destPostcode')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addDest(); } });
@@ -1151,6 +1182,7 @@ function bind() {
   try {
     await loadProperties();
     renderAll();
+    switchPage(ui.page);   // restore the last page (Explore / Curate & track)
   } catch (err) {
     document.getElementById('propertyList').innerHTML =
       '<p class="empty">Could not reach the Nest server. Start it with <code>npm start</code> and open this page at the address it prints.</p>';
