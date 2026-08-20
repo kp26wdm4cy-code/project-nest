@@ -486,8 +486,13 @@ async function initialise() {
   // Seed the sign-in allow-list once (Ralf can add others from the app). Without an
   // entry here nobody could bootstrap the first login.
   if ((await getSetting('allowed_users', null)) == null) await setSetting('allowed_users', [{ email: 'ralf.g.saade@gmail.com', name: 'Ralf' }]);
+  // The host administers the global "who can sign in" list; everyone else only manages
+  // their own space. Seeded to Ralf; change via the host_email setting if needed.
+  if ((await getSetting('host_email', null)) == null) await setSetting('host_email', 'ralf.g.saade@gmail.com');
   await migrateWorkspaces();
 }
+const getHostEmail = async () => normEmail(await getSetting('host_email', 'ralf.g.saade@gmail.com'));
+async function isHostUser(user) { return !!user && normEmail(user.email) === await getHostEmail(); }
 // One-time move to per-household workspaces: put all pre-existing data in one default
 // workspace, copy its settings across, and seed its membership from the allow-list.
 const DEFAULT_WS = 'ws-home';
@@ -550,16 +555,15 @@ async function reconcileSpacePeople(wsId, actor, desired) {
   for (const inv of invites) { const e = normEmail(inv.email); if (!want.has(e)) await db.execute({ sql: 'DELETE FROM invites WHERE workspace_id=? AND email=?', args: [wsId, e] }); }
   const memberEmails = new Set(members.map(m => normEmail(m.email)));
   const inviteEmails = new Set(invites.map(i => normEmail(i.email)));
-  const allow = new Map((await getAllowed()).map(u => [normEmail(u.email), u]));
   for (const p of byEmail.values()) {
-    if (!allow.has(p.email)) allow.set(p.email, { email: p.email, name: p.name });   // let them sign in
+    // The invite itself grants sign-in (signInIdentity checks invites) — no need to touch
+    // the host's global allow-list.
     if (p.email === actorEmail || memberEmails.has(p.email) || inviteEmails.has(p.email)) continue;
     const existing = (await db.execute({ sql: 'SELECT id FROM users WHERE email=?', args: [p.email] })).rows[0];
     const settled = existing && (await db.execute({ sql: 'SELECT 1 FROM memberships WHERE user_id=? LIMIT 1', args: [existing.id] })).rows[0];
     if (existing && !settled) await db.execute({ sql: 'INSERT OR IGNORE INTO memberships(workspace_id,user_id,role,created_at) VALUES(?,?,?,?)', args: [wsId, existing.id, 'member', nowISO()] });
     else await db.execute({ sql: 'INSERT OR IGNORE INTO invites(workspace_id,email,name,role,created_at) VALUES(?,?,?,?,?)', args: [wsId, p.email, p.name, 'member', nowISO()] });
   }
-  await setSetting('allowed_users', [...allow.values()].slice(0, 50));
 }
 async function getSetting(key, fallback) {
   try { const r = (await db.execute({ sql: 'SELECT value FROM settings WHERE key=?', args: [key] })).rows[0]; return r ? JSON.parse(r.value) : fallback; }
@@ -701,6 +705,18 @@ const normEmail = e => String(e || '').trim().toLowerCase();
 const validEmail = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e);
 async function getAllowed() { return (await getSetting('allowed_users', [])) || []; }
 async function allowedEntry(email) { const e = normEmail(email); return (await getAllowed()).find(u => normEmail(u.email) === e) || null; }
+// Who may sign in: on the host's global allow-list, OR invited to some space, OR already a
+// member of one. This lets a space owner share their space (via an invite) without needing
+// the host to also allow-list that person. Returns {email,name} or null.
+async function signInIdentity(email) {
+  const e = normEmail(email);
+  const a = await allowedEntry(e); if (a) return { email: e, name: a.name };
+  const inv = (await db.execute({ sql: 'SELECT name FROM invites WHERE email=? LIMIT 1', args: [e] })).rows[0];
+  if (inv) return { email: e, name: inv.name || e.split('@')[0] };
+  const mem = (await db.execute({ sql: 'SELECT u.name FROM memberships m JOIN users u ON u.id=m.user_id WHERE u.email=? LIMIT 1', args: [e] })).rows[0];
+  if (mem) return { email: e, name: mem.name || e.split('@')[0] };
+  return null;
+}
 function parseCookies(req) {
   const out = {}, h = req.headers.cookie; if (!h) return out;
   for (const part of h.split(';')) { const i = part.indexOf('='); if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); }
@@ -724,10 +740,10 @@ async function currentUser(req) {
 // Returns after writing the response. Used by both auth methods so they behave identically.
 async function establishSession(req, res, email) {
   const e = normEmail(email);
-  const entry = await allowedEntry(e);
-  if (!entry) { res.writeHead(302, { Location: '/?auth=denied' }); return res.end(); }
+  const ident = await signInIdentity(e);
+  if (!ident) { res.writeHead(302, { Location: '/?auth=denied' }); return res.end(); }
   let u = (await db.execute({ sql: 'SELECT id FROM users WHERE email=?', args: [e] })).rows[0];
-  if (!u) { const id = 'u-' + randomBytes(8).toString('hex'); await db.execute({ sql: 'INSERT INTO users(id,email,name,created_at,last_login) VALUES(?,?,?,?,?)', args: [id, e, entry.name || e.split('@')[0], nowISO(), nowISO()] }); u = { id }; }
+  if (!u) { const id = 'u-' + randomBytes(8).toString('hex'); await db.execute({ sql: 'INSERT INTO users(id,email,name,created_at,last_login) VALUES(?,?,?,?,?)', args: [id, e, ident.name || e.split('@')[0], nowISO(), nowISO()] }); u = { id }; }
   else await db.execute({ sql: 'UPDATE users SET last_login=? WHERE id=?', args: [nowISO(), u.id] });
   const stoken = randomBytes(24).toString('hex');
   await db.execute({ sql: 'INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)', args: [stoken, u.id, nowISO(), isoIn(SESSION_DAYS * 864e5)] });
@@ -922,7 +938,7 @@ createServer(async (req, res) => {
     try {
       const email = normEmail(JSON.parse(body || '{}').email);
       if (!validEmail(email)) return send(res, 400, JSON.stringify({ error: 'Enter a valid email address.' }));
-      const entry = await allowedEntry(email);
+      const entry = await signInIdentity(email);
       let devLink = null;
       if (entry) {
         const token = randomBytes(24).toString('hex');
@@ -1017,11 +1033,16 @@ createServer(async (req, res) => {
     try { return send(res, 200, JSON.stringify(await refineLocations(req.wsId))); }
     catch (e) { return send(res, 200, JSON.stringify({ updated: 0, error: String(e && e.message || e) })); }
   }
-  const settingsPayload = async () => ({
-    searchDistricts: await getSearchDistricts(req.wsId), destinations: await getDestinations(req.wsId),
-    emails: await wsGet(req.wsId, 'emails', []), briefs: await getBriefs(req.wsId), allowedUsers: await getAllowed(),
-    space: { id: req.wsId, name: await workspaceName(req.wsId), people: await workspacePeople(req.wsId) }, you: normEmail(req.user.email),
-  });
+  const settingsPayload = async () => {
+    const host = await isHostUser(req.user);
+    return {
+      searchDistricts: await getSearchDistricts(req.wsId), destinations: await getDestinations(req.wsId),
+      emails: await wsGet(req.wsId, 'emails', []), briefs: await getBriefs(req.wsId),
+      space: { id: req.wsId, name: await workspaceName(req.wsId), people: await workspacePeople(req.wsId) }, you: normEmail(req.user.email),
+      isHost: host,
+      ...(host ? { allowedUsers: await getAllowed() } : {}),   // the global sign-in list is host-only
+    };
+  };
   if (url.pathname === '/api/settings' && req.method === 'GET')
     return send(res, 200, JSON.stringify(await settingsPayload()));
   if (url.pathname === '/api/settings' && req.method === 'PUT') {
@@ -1050,7 +1071,7 @@ createServer(async (req, res) => {
         }
         await wsSet(ws, 'briefs', cur);
       }
-      if (Array.isArray(b.allowedUsers)) {   // global "who can sign in at all"
+      if (Array.isArray(b.allowedUsers) && await isHostUser(req.user)) {   // global "who can sign in" — host only
         const clean = b.allowedUsers
           .filter(u => u && validEmail(normEmail(u.email)))
           .map(u => ({ email: normEmail(u.email), name: String(u.name || '').trim().slice(0, 40) || normEmail(u.email).split('@')[0] }));

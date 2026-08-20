@@ -22,7 +22,8 @@ let galShots = [], galIndex = 0;  // current gallery images for the full-screen 
 let districtLayer = null, selectedDistricts = new Set(), areaMode = false, saveDistTimer;
 let destinations = [], subscribedEmails = [];
 let briefs = { buy: { maxPrice: 550000, minPrice: 120000, beds: [1, 2] }, rent: { maxPrice: 2500, minPrice: 800, beds: [1, 2] } };
-let allowedUsers = [];   // emails permitted to sign in ({email,name})
+let allowedUsers = [];   // emails permitted to sign in ({email,name}) — host only
+let isHost = false;      // whether the signed-in user administers the global sign-in list
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
 // Rentals carry a monthly price; sales an outright price. One label formatter for both.
@@ -317,7 +318,7 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
   renderModeChrome();
   updateAreaToggle();
   showDistricts();   // always render a faint shade for the selected areas
@@ -376,8 +377,10 @@ function addEmail() {
 
 // ---- who can sign in (allow-list = lightweight invites) -------------------
 function renderAllowChips() {
+  const section = document.getElementById('allowSection');
+  if (section) section.hidden = !isHost;   // the global sign-in list is host-only
   const box = document.getElementById('allowChips');
-  if (!box) return;
+  if (!box || !isHost) return;
   box.innerHTML = allowedUsers.length
     ? allowedUsers.map((u, i) => `<span class="dest-chip">${esc(u.name)} · ${esc(u.email)}<button data-i="${i}" aria-label="Remove ${esc(u.email)}">×</button></span>`).join('')
     : '<span class="dest-empty">No one added yet.</span>';
