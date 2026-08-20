@@ -250,10 +250,16 @@ async function addListing(listingUrl, opts = {}) {
   if (lat == null) { const geo = await geocode(ex.postcode, ex.outcode); if (geo) { lat = geo.lat; lng = geo.lng; district = geo.district; } }
   if (lat == null) return { error: 'Could not work out the location from that page. A Rightmove link works best.' };
   if (!ex.price) return { error: 'Could not read the price from that page.' };
+  const wsId = opts.wsId || DEFAULT_WS;
   const rmId = (u.href.match(/(\d{5,})/) || [])[1];
   const prefix = /rightmove/i.test(u.hostname) ? 'rm-' : /zoopla/i.test(u.hostname) ? 'zp-' : /onthemarket/i.test(u.hostname) ? 'otm-' : 'pl-';
-  const id = prefix + (rmId || slug(ex.area).slice(0, 24) || Math.abs([...u.href].reduce((a, c) => a * 31 + c.charCodeAt(0) | 0, 7)).toString(36));
-  const exists = (await db.execute({ sql: 'SELECT id FROM properties WHERE id=?', args: [id] })).rows[0];
+  const baseId = prefix + (rmId || slug(ex.area).slice(0, 24) || Math.abs([...u.href].reduce((a, c) => a * 31 + c.charCodeAt(0) | 0, 7)).toString(36));
+  // Property ids are globally unique (the PK), so namespace them per workspace — the same
+  // listing can live in two different couples' spaces. The default space keeps bare ids.
+  const id = wsId === DEFAULT_WS ? baseId : `${baseId}@${wsId.slice(-8)}`;
+  // "Already have it" is scoped to THIS workspace (matched by the listing URL, robust to
+  // the id scheme) — another space having the same listing doesn't block this one.
+  const exists = (await db.execute({ sql: 'SELECT id FROM properties WHERE workspace_id=? AND (id=? OR listing_url=?)', args: [wsId, id, u.href] })).rows[0];
   const street = (ex.area.split(',')[0] || ex.area || 'Home').trim();
   const name = `${ex.beds ? ex.beds + ' bed ' : ''}${ex.type}, ${street}`.trim();
   const areaLabel = (ex.area || [district, ex.outcode].filter(Boolean).join(', ') || 'Location').slice(0, 80);
@@ -266,11 +272,11 @@ async function addListing(listingUrl, opts = {}) {
       ? 'Ask for: deposit and holding-deposit terms, minimum tenancy length, whether bills/council tax/parking are included, furnished or not, and pet/decor rules. Confirm the exact available-from date and any renewal terms.'
       : 'Ask for: service charge, lease length, EPC, exact floor plan and a viewing. Confirm the precise location and any planned works.';
     await db.execute({
-      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score,tenure,lease_years,listed_date,listed_reason,listing_type,available_from)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      sql: `INSERT INTO properties (id,name,area,price,bedrooms,size,latitude,longitude,listing_url,recommendation,confidence,agent_view,checks,tags,created_at,suggest_score,tenure,lease_years,listed_date,listed_reason,listing_type,available_from,workspace_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       args: [id, name, areaLabel, ex.price, ex.beds || 0, ex.size || 'Size TBC', lat, lng, u.href, 'View', 'Medium', agentView,
         checks, tags, new Date().toISOString(), opts.score != null ? Math.round(opts.score) : null, ex.tenure || null, ex.leaseYears || null, ex.listedDate || null, ex.listedReason || null,
-        ex.channel || 'buy', ex.availableFrom || null],
+        ex.channel || 'buy', ex.availableFrom || null, wsId],
     });
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
     (async () => {
@@ -279,7 +285,7 @@ async function addListing(listingUrl, opts = {}) {
         await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), data.computedAt] });
       } catch { }
     })();
-    (async () => { try { const dests = await getDestinations(); if (dests.length) await storeCommutes(id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { } })();
+    (async () => { try { const dests = await getDestinations(wsId); if (dests.length) await storeCommutes(id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { } })();
     // Last-sold price is a purchase concept — skip it for rentals.
     if (!rent) (async () => { try { const sold = await fetchSold(ex.postcode, ex.area, { price: ex.price, flat: /flat|apartment|maison|studio/i.test(ex.type) }); if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, id] }); } catch { } })();
   }
@@ -292,14 +298,14 @@ const outcodesIn = s => (String(s).match(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/gi) || []).
 // The search brief per mode (editable in the app, stored in settings). maxPrice is the
 // hard ceiling (monthly for rent); minPrice drops teasers/shared-ownership fragments.
 const DEFAULT_BRIEF = { buy: { maxPrice: 550000, minPrice: 120000, beds: [1, 2] }, rent: { maxPrice: 2500, minPrice: 800, beds: [1, 2] } };
-async function getBriefs() {
-  const saved = await getSetting('briefs', null);
+async function getBriefs(wsId) {
+  const saved = await wsGet(wsId, 'briefs', null);
   const out = { buy: { ...DEFAULT_BRIEF.buy }, rent: { ...DEFAULT_BRIEF.rent } };
   if (saved && typeof saved === 'object') for (const m of ['buy', 'rent']) if (saved[m] && typeof saved[m] === 'object') out[m] = { ...out[m], ...saved[m] };
   return out;
 }
-async function buildTaste(mode = 'buy') {
-  const props = (await db.execute({ sql: "SELECT id, price, area, tags, agent_view FROM properties WHERE COALESCE(listing_type,'buy')=?", args: [mode] })).rows;
+async function buildTaste(mode = 'buy', wsId) {
+  const props = (await db.execute({ sql: "SELECT id, price, area, tags, agent_view FROM properties WHERE COALESCE(listing_type,'buy')=? AND workspace_id=?", args: [mode, wsId] })).rows;
   const fb = (await db.execute('SELECT property_id, verdict, note FROM feedback')).rows;
   const byId = new Map(props.map(p => [p.id, p]));
   const pos = [], neg = [];
@@ -369,17 +375,17 @@ function parseSearchResults(html) {
     };
   }).filter(p => p.id && p.price);
 }
-async function getSearchDistricts() {
-  const d = await getSetting('search_districts', null);
+async function getSearchDistricts(wsId) {
+  const d = await wsGet(wsId, 'search_districts', null);
   return (Array.isArray(d) && d.length) ? d : DEFAULT_DISTRICTS;
 }
 // Keep at most `cap` UNTOUCHED suggestions (auto-added, no verdict yet). Anything
 // the couple has reacted to, added by hand, or seeded is never touched.
-async function capSuggestions(cap, mode = 'buy') {
+async function capSuggestions(cap, mode = 'buy', wsId) {
   const rows = (await db.execute({
     sql: `SELECT id FROM properties
-    WHERE tags LIKE '%suggested%' AND COALESCE(listing_type,'buy')=? AND id NOT IN (SELECT property_id FROM feedback)
-    ORDER BY COALESCE(suggest_score,0) DESC`, args: [mode],
+    WHERE tags LIKE '%suggested%' AND COALESCE(listing_type,'buy')=? AND workspace_id=? AND id NOT IN (SELECT property_id FROM feedback)
+    ORDER BY COALESCE(suggest_score,0) DESC`, args: [mode, wsId],
   })).rows;
   const doomed = rows.slice(cap).map(r => r.id);
   for (const id of doomed) {
@@ -389,14 +395,15 @@ async function capSuggestions(cap, mode = 'buy') {
   return doomed.length;
 }
 async function discover(opts = {}) {
+  const wsId = opts.wsId || DEFAULT_WS;
   const mode = opts.mode === 'rent' ? 'rent' : 'buy';
   const max = opts.max || 4;            // how many new homes to add this run
-  const brief = (await getBriefs())[mode];
+  const brief = (await getBriefs(wsId))[mode];
   const minPrice = brief.minPrice || (mode === 'rent' ? 500 : 120000);
-  const taste = await buildTaste(mode);
-  const areas = (await getSearchDistricts()).slice(0, opts.maxAreas || 5);
+  const taste = await buildTaste(mode, wsId);
+  const areas = (await getSearchDistricts(wsId)).slice(0, opts.maxAreas || 5);
   const searchPath = mode === 'rent' ? 'property-to-rent' : 'property-for-sale';
-  const existing = new Set((await db.execute('SELECT listing_url FROM properties')).rows
+  const existing = new Set((await db.execute({ sql: 'SELECT listing_url FROM properties WHERE workspace_id=?', args: [wsId] })).rows
     .map(r => (String(r.listing_url).match(/(\d{5,})/) || [])[1]).filter(Boolean));
   const seen = new Set(), candidates = [];
   for (const area of areas) {
@@ -420,11 +427,11 @@ async function discover(opts = {}) {
   }).sort((a, b) => b.score - a.score);
   const added = [];
   for (const t of scored.slice(0, max)) {
-    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief'), score: t.score }).catch(() => null);
+    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief'), score: t.score, wsId }).catch(() => null);
     if (r && r.ok && !r.existing) added.push({ name: r.name, why: t.why });
     await sleep(600);
   }
-  if (opts.poolCap) await capSuggestions(opts.poolCap, mode);
+  if (opts.poolCap) await capSuggestions(opts.poolCap, mode, wsId);
   return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode };
 }
 
@@ -463,11 +470,15 @@ async function initialise() {
   CREATE TABLE IF NOT EXISTS guest_notes (property_id TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL, last_login TEXT);
   CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS login_tokens (token TEXT PRIMARY KEY, email TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT);`);
+  CREATE TABLE IF NOT EXISTS login_tokens (token TEXT PRIMARY KEY, email TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT);
+  CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS memberships (workspace_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL, PRIMARY KEY(workspace_id,user_id));
+  CREATE TABLE IF NOT EXISTS invites (workspace_id TEXT NOT NULL, email TEXT NOT NULL, name TEXT, role TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL, PRIMARY KEY(workspace_id,email));
+  CREATE TABLE IF NOT EXISTS ws_settings (workspace_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(workspace_id,key));`);
   // Columns added over time — guarded so re-running is harmless.
   for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER',
     'listed_date TEXT', 'listed_reason TEXT', 'last_sold_price INTEGER', 'last_sold_date TEXT', 'last_sold_exact INTEGER',
-    "listing_type TEXT NOT NULL DEFAULT 'buy'", 'available_from TEXT']) {
+    "listing_type TEXT NOT NULL DEFAULT 'buy'", 'available_from TEXT', 'workspace_id TEXT']) {
     try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
   }
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
@@ -475,6 +486,80 @@ async function initialise() {
   // Seed the sign-in allow-list once (Ralf can add others from the app). Without an
   // entry here nobody could bootstrap the first login.
   if ((await getSetting('allowed_users', null)) == null) await setSetting('allowed_users', [{ email: 'ralf.g.saade@gmail.com', name: 'Ralf' }]);
+  await migrateWorkspaces();
+}
+// One-time move to per-household workspaces: put all pre-existing data in one default
+// workspace, copy its settings across, and seed its membership from the allow-list.
+const DEFAULT_WS = 'ws-home';
+async function migrateWorkspaces() {
+  if (await getSetting('ws_migrated', false)) return;
+  await db.execute({ sql: 'INSERT OR IGNORE INTO workspaces(id,name,created_at) VALUES(?,?,?)', args: [DEFAULT_WS, 'Ralf & Hannah', nowISO()] });
+  await db.execute({ sql: 'UPDATE properties SET workspace_id=? WHERE workspace_id IS NULL', args: [DEFAULT_WS] });
+  for (const key of ['search_districts', 'destinations', 'emails', 'briefs']) {
+    const v = await getSetting(key, null);
+    if (v != null) await wsSet(DEFAULT_WS, key, v);
+  }
+  const allowed = await getSetting('allowed_users', []);
+  for (const [i, u] of (allowed || []).entries())
+    await db.execute({ sql: 'INSERT OR IGNORE INTO invites(workspace_id,email,name,role,created_at) VALUES(?,?,?,?,?)', args: [DEFAULT_WS, normEmail(u.email), u.name || null, i === 0 ? 'owner' : 'member', nowISO()] });
+  // anyone who already signed in (e.g. Ralf under v3) joins the default space as an owner
+  for (const usr of (await db.execute('SELECT id FROM users')).rows)
+    await db.execute({ sql: 'INSERT OR IGNORE INTO memberships(workspace_id,user_id,role,created_at) VALUES(?,?,?,?)', args: [DEFAULT_WS, usr.id, 'owner', nowISO()] });
+  await setSetting('ws_migrated', true);
+}
+// Per-workspace settings (search areas, destinations, subscribers, briefs) live in ws_settings.
+async function wsGet(wsId, key, fallback) { try { const r = (await db.execute({ sql: 'SELECT value FROM ws_settings WHERE workspace_id=? AND key=?', args: [wsId, key] })).rows[0]; return r ? JSON.parse(r.value) : fallback; } catch { return fallback; } }
+async function wsSet(wsId, key, value) { await db.execute({ sql: 'INSERT INTO ws_settings(workspace_id,key,value) VALUES(?,?,?) ON CONFLICT(workspace_id,key) DO UPDATE SET value=excluded.value', args: [wsId, key, JSON.stringify(value)] }); }
+// Resolve which workspace a user is in — their membership, else a pending invite they now
+// accept, else a brand-new private workspace of their own.
+async function userWorkspace(user) {
+  const m = (await db.execute({ sql: 'SELECT workspace_id FROM memberships WHERE user_id=? ORDER BY created_at LIMIT 1', args: [user.id] })).rows[0];
+  if (m) return m.workspace_id;
+  const inv = (await db.execute({ sql: 'SELECT workspace_id, role FROM invites WHERE email=? LIMIT 1', args: [normEmail(user.email)] })).rows[0];
+  if (inv) {
+    await db.execute({ sql: 'INSERT OR IGNORE INTO memberships(workspace_id,user_id,role,created_at) VALUES(?,?,?,?)', args: [inv.workspace_id, user.id, inv.role || 'member', nowISO()] });
+    await db.execute({ sql: 'DELETE FROM invites WHERE workspace_id=? AND email=?', args: [inv.workspace_id, normEmail(user.email)] });
+    return inv.workspace_id;
+  }
+  const id = 'ws-' + randomBytes(6).toString('hex');
+  await db.execute({ sql: 'INSERT INTO workspaces(id,name,created_at) VALUES(?,?,?)', args: [id, `${user.name}'s search`, nowISO()] });
+  await db.execute({ sql: 'INSERT INTO memberships(workspace_id,user_id,role,created_at) VALUES(?,?,?,?)', args: [id, user.id, 'owner', nowISO()] });
+  return id;
+}
+async function workspaceName(wsId) { const w = (await db.execute({ sql: 'SELECT name FROM workspaces WHERE id=?', args: [wsId] })).rows[0]; return w ? w.name : 'Your search'; }
+// Members (joined) + pending invites for a space, for the "People in this space" box.
+async function workspacePeople(wsId) {
+  const mem = (await db.execute({ sql: 'SELECT u.id, u.email, u.name, m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.workspace_id=? ORDER BY m.created_at', args: [wsId] })).rows
+    .map(r => ({ id: r.id, email: r.email, name: r.name, role: r.role, joined: true }));
+  const inv = (await db.execute({ sql: 'SELECT email, name, role FROM invites WHERE workspace_id=? ORDER BY created_at', args: [wsId] })).rows
+    .map(r => ({ email: r.email, name: r.name || r.email.split('@')[0], role: r.role, joined: false }));
+  return [...mem, ...inv];
+}
+// Make a space's roster match `desired` [{email,name}] — add invites/memberships for new
+// people, drop those removed (never the actor). Sharing also allow-lists the email so they
+// can sign in. Someone already settled in another space gets a pending invite, not a move.
+async function reconcileSpacePeople(wsId, actor, desired) {
+  const actorEmail = normEmail(actor.email);
+  const byEmail = new Map();
+  for (const p of desired) { const e = normEmail(p && p.email); if (validEmail(e)) byEmail.set(e, { email: e, name: String(p.name || '').trim().slice(0, 40) || e.split('@')[0] }); }
+  byEmail.set(actorEmail, byEmail.get(actorEmail) || { email: actorEmail, name: actor.name }); // never drop yourself
+  const want = new Set(byEmail.keys());
+  const members = (await db.execute({ sql: 'SELECT u.id, u.email FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.workspace_id=?', args: [wsId] })).rows;
+  const invites = (await db.execute({ sql: 'SELECT email FROM invites WHERE workspace_id=?', args: [wsId] })).rows;
+  for (const m of members) { const e = normEmail(m.email); if (e !== actorEmail && !want.has(e)) await db.execute({ sql: 'DELETE FROM memberships WHERE workspace_id=? AND user_id=?', args: [wsId, m.id] }); }
+  for (const inv of invites) { const e = normEmail(inv.email); if (!want.has(e)) await db.execute({ sql: 'DELETE FROM invites WHERE workspace_id=? AND email=?', args: [wsId, e] }); }
+  const memberEmails = new Set(members.map(m => normEmail(m.email)));
+  const inviteEmails = new Set(invites.map(i => normEmail(i.email)));
+  const allow = new Map((await getAllowed()).map(u => [normEmail(u.email), u]));
+  for (const p of byEmail.values()) {
+    if (!allow.has(p.email)) allow.set(p.email, { email: p.email, name: p.name });   // let them sign in
+    if (p.email === actorEmail || memberEmails.has(p.email) || inviteEmails.has(p.email)) continue;
+    const existing = (await db.execute({ sql: 'SELECT id FROM users WHERE email=?', args: [p.email] })).rows[0];
+    const settled = existing && (await db.execute({ sql: 'SELECT 1 FROM memberships WHERE user_id=? LIMIT 1', args: [existing.id] })).rows[0];
+    if (existing && !settled) await db.execute({ sql: 'INSERT OR IGNORE INTO memberships(workspace_id,user_id,role,created_at) VALUES(?,?,?,?)', args: [wsId, existing.id, 'member', nowISO()] });
+    else await db.execute({ sql: 'INSERT OR IGNORE INTO invites(workspace_id,email,name,role,created_at) VALUES(?,?,?,?,?)', args: [wsId, p.email, p.name, 'member', nowISO()] });
+  }
+  await setSetting('allowed_users', [...allow.values()].slice(0, 50));
 }
 async function getSetting(key, fallback) {
   try { const r = (await db.execute({ sql: 'SELECT value FROM settings WHERE key=?', args: [key] })).rows[0]; return r ? JSON.parse(r.value) : fallback; }
@@ -484,7 +569,7 @@ async function setSetting(key, value) {
   await db.execute({ sql: 'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', args: [key, JSON.stringify(value)] });
 }
 const DEFAULT_DISTRICTS = ['N1', 'E2', 'E9', 'E3', 'N16', 'N5', 'E8', 'E5']; // Hoxton, Victoria Park, Bow, Stoke Newington, Highbury…
-const getDestinations = () => getSetting('destinations', []);
+const getDestinations = wsId => wsGet(wsId, 'destinations', []);
 
 // --- commute times (TfL Journey Planner) ----------------------------------
 async function computeCommutes(property, destinations) {
@@ -517,20 +602,24 @@ async function computeCommutes(property, destinations) {
 async function storeCommutes(id, data) {
   await db.execute({ sql: `INSERT INTO commutes(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), new Date().toISOString()] });
 }
-async function refreshCommutes() {
-  const dests = await getDestinations();
-  const props = (await db.execute('SELECT id, latitude, longitude FROM properties')).rows;
-  for (const p of props) {
-    try { await storeCommutes(p.id, dests.length ? await computeCommutes(p, dests) : []); } catch { }
+async function refreshCommutes(only) {
+  // Each workspace has its own commute destinations, so recompute per workspace.
+  const wss = only ? [{ id: only }] : (await db.execute('SELECT id FROM workspaces')).rows;
+  for (const w of wss) {
+    const dests = await getDestinations(w.id);
+    const props = (await db.execute({ sql: 'SELECT id, latitude, longitude FROM properties WHERE workspace_id=?', args: [w.id] })).rows;
+    for (const p of props) {
+      try { await storeCommutes(p.id, dests.length ? await computeCommutes(p, dests) : []); } catch { }
+    }
   }
 }
 // Re-geocode saved homes to their exact street postcode. Older/discovered listings that
 // only had an outcode landed on the district centroid (several stacking on one point);
 // this re-reads each page, recovers the full postcode, and moves the pin to the real
 // spot, then refreshes area intelligence + commutes for the new location.
-async function refineLocations() {
-  const props = (await db.execute('SELECT id, listing_url, latitude, longitude FROM properties WHERE listing_url IS NOT NULL')).rows;
-  const dests = await getDestinations();
+async function refineLocations(wsId) {
+  const props = (await db.execute({ sql: 'SELECT id, listing_url, latitude, longitude FROM properties WHERE listing_url IS NOT NULL AND workspace_id=?', args: [wsId] })).rows;
+  const dests = await getDestinations(wsId);
   let updated = 0; const changes = [];
   for (const p of props) {
     try {
@@ -552,10 +641,9 @@ async function refineLocations() {
 
 // --- weekly email summary (Resend) ----------------------------------------
 const SITE_URL = 'https://project-nest-2mzu.onrender.com';
-async function sendWeekly() {
-  const emails = await getSetting('emails', []);
-  if (!emails.length) return { sent: 0, note: 'no subscribers' };
-  const all = await rows('');
+// Build + send one workspace's weekly digest to its subscribers.
+async function sendWeeklyForWorkspace(wsId, emails, key, from) {
+  const all = await rows('', wsId);
   const weekAgo = Date.now() - 7 * 864e5;
   const newSug = all.filter(p => p.tags.includes('suggested') && p.created_at && Date.parse(p.created_at) >= weekAgo);
   const drops = all.filter(p => p.price_changed_at && Date.parse(p.price_changed_at) >= weekAgo && p.prev_price && p.price < p.prev_price);
@@ -570,10 +658,6 @@ async function sendWeekly() {
     ${(!newSug.length && !drops.length) ? `<p style="color:#556">No new suggestions or price drops this week — nothing new beat what you already have.</p>` : ''}
     <p style="margin-top:26px"><a href="${SITE_URL}" style="background:#285b43;color:#fff;padding:11px 20px;text-decoration:none;border-radius:4px;display:inline-block">Open Nest ↗</a></p>
     <p style="color:#99a;font-size:12px;margin-top:24px">You subscribed to this in Nest. To stop, remove your address in the app.</p></div>`;
-  // Sent via SendGrid: verify one sender address (SENDGRID_FROM) and it can email
-  // any subscriber — no domain needed.
-  const key = process.env.SENDGRID_API_KEY, from = process.env.SENDGRID_FROM;
-  if (!key || !from) return { sent: 0, note: 'SENDGRID_API_KEY / SENDGRID_FROM not set — nothing sent', preview: { newSug: newSug.length, drops: drops.length, to: emails } };
   const subject = `Nest weekly — ${newSug.length} new, ${drops.length} price drop${drops.length === 1 ? '' : 's'}`;
   let sent = 0; const errors = [];
   for (const to of emails) {
@@ -588,6 +672,21 @@ async function sendWeekly() {
     await new Promise(r => setTimeout(r, 300));
   }
   return { sent, newSug: newSug.length, drops: drops.length, errors };
+}
+// Weekly digest across every workspace — each gets its own homes to its own subscribers.
+async function sendWeekly() {
+  const key = process.env.SENDGRID_API_KEY, from = process.env.SENDGRID_FROM;
+  const wss = (await db.execute('SELECT id FROM workspaces')).rows;
+  let sent = 0; const per = [], preview = [];
+  for (const w of wss) {
+    const emails = await wsGet(w.id, 'emails', []);
+    if (!emails.length) continue;
+    if (!key || !from) { preview.push({ ws: w.id, to: emails }); continue; }
+    const r = await sendWeeklyForWorkspace(w.id, emails, key, from);
+    sent += r.sent; per.push({ ws: w.id, ...r });
+  }
+  if (!key || !from) return { sent: 0, note: 'SENDGRID_API_KEY / SENDGRID_FROM not set — nothing sent', preview };
+  return { sent, workspaces: per };
 }
 
 // --- authentication: passwordless magic-link sign-in ----------------------
@@ -668,8 +767,8 @@ async function seed() {
   await db.batch(data.map(row => ({ sql, args: [...row, created] })), 'write');
 }
 
-async function rows(person) {
-  const properties = (await db.execute('SELECT * FROM properties ORDER BY created_at DESC')).rows;
+async function rows(person, wsId) {
+  const properties = (await db.execute({ sql: 'SELECT * FROM properties WHERE workspace_id=? ORDER BY created_at DESC', args: [wsId] })).rows;
   const feedback = (await db.execute('SELECT property_id, person, verdict, note, updated_at FROM feedback')).rows;
   const insights = (await db.execute('SELECT property_id, data FROM insights')).rows;
   const media = (await db.execute('SELECT property_id, data FROM media')).rows;
@@ -729,12 +828,14 @@ async function refreshInsights() {
 function send(res, code, body, type = 'application/json; charset=utf-8') { res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store' }); res.end(body); }
 function csv(value) { const text = value == null ? '' : String(value); return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
 
-async function exportCsv() {
-  const headings = ['Property', 'Buy/Rent', 'Area', 'Price', 'Bedrooms', 'Size', 'Tenure', 'Lease years', 'Available from', 'Listed', 'Last sold £', 'Last sold date', 'Recommendation', 'Confidence', 'Availability', 'Listing link', 'Latitude', 'Longitude', 'Last checked', 'Ralf verdict', 'Ralf note', 'Hannah verdict', 'Hannah note', 'Agent view', 'Checks'];
-  const all = await rows('');
+async function exportCsv(wsId) {
+  const headings = ['Property', 'Buy/Rent', 'Area', 'Price', 'Bedrooms', 'Size', 'Tenure', 'Lease years', 'Available from', 'Listed', 'Last sold £', 'Last sold date', 'Recommendation', 'Confidence', 'Availability', 'Listing link', 'Latitude', 'Longitude', 'Last checked', 'Verdicts', 'Notes', 'Agent view', 'Checks'];
+  const all = await rows('', wsId);
   const lines = all.map(p => {
-    const f = person => p.feedback.find(x => x.person.toLowerCase() === person.toLowerCase()) || {};
-    return [p.name, p.listing_type === 'rent' ? 'Rent' : 'Buy', p.area, p.price, p.bedrooms, p.size, p.tenure, p.lease_years, p.available_from, p.listed_date, p.last_sold_price, p.last_sold_date, p.recommendation, p.confidence, p.availability, p.listing_url, p.latitude, p.longitude, p.last_checked, f('Ralf').verdict, f('Ralf').note, f('Hannah').verdict, f('Hannah').note, p.agent_view, p.checks].map(csv).join(',');
+    // Verdicts/notes span whoever reacted (any number of members), not fixed people.
+    const verdicts = p.feedback.filter(f => f.verdict).map(f => `${f.person}: ${f.verdict}`).join('; ');
+    const notes = p.feedback.filter(f => f.note).map(f => `${f.person}: ${f.note}`).join('; ');
+    return [p.name, p.listing_type === 'rent' ? 'Rent' : 'Buy', p.area, p.price, p.bedrooms, p.size, p.tenure, p.lease_years, p.available_from, p.listed_date, p.last_sold_price, p.last_sold_date, p.recommendation, p.confidence, p.availability, p.listing_url, p.latitude, p.longitude, p.last_checked, verdicts, notes, p.agent_view, p.checks].map(csv).join(',');
   });
   return [headings.join(','), ...lines].join('\r\n');
 }
@@ -878,25 +979,34 @@ createServer(async (req, res) => {
   }
   if (url.pathname === '/api/me' && req.method === 'GET') {
     const u = await currentUser(req);
-    return send(res, 200, JSON.stringify({ user: u ? { id: u.id, email: u.email, name: u.name } : null }));
+    if (!u) return send(res, 200, JSON.stringify({ user: null }));
+    const wsId = await userWorkspace(u);   // provisions/joins a workspace on first call
+    return send(res, 200, JSON.stringify({ user: { id: u.id, email: u.email, name: u.name }, workspace: { id: wsId, name: await workspaceName(wsId) } }));
   }
 
-  // --- gate: every other /api route needs a signed-in user, except the two
-  //     cron-triggered jobs (they act on shared data with no private read-back).
+  // --- gate: every other /api route needs a signed-in user (and resolves their
+  //     workspace), except the two cron-triggered jobs which run per-workspace.
   const OPEN_API = new Set(['/api/discover', '/api/send-weekly']);
   if (url.pathname.startsWith('/api/') && !OPEN_API.has(url.pathname)) {
     const u = await currentUser(req);
     if (!u) return send(res, 401, JSON.stringify({ error: 'Sign in required.' }));
     req.user = u;
+    req.wsId = await userWorkspace(u);
   }
 
-  if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(req.user.name)));
-  if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(), 'text/csv; charset=utf-8');
+  if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(req.user.name, req.wsId)));
+  if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(req.wsId), 'text/csv; charset=utf-8');
   if (url.pathname === '/api/refresh' && req.method === 'POST') return send(res, 200, JSON.stringify(await refresh()));
   if (url.pathname === '/api/discover' && req.method === 'POST') {
     const scheduled = url.searchParams.get('scheduled') === '1';
     const mode = url.searchParams.get('mode') === 'rent' ? 'rent' : 'buy';
-    try { return send(res, 200, JSON.stringify(await discover(scheduled ? { max: 8, poolCap: 20, maxAreas: 8, mode } : { mode }))); }
+    if (scheduled) {   // cron: discover for every workspace using each one's own brief/areas
+      try { const wss = (await db.execute('SELECT id FROM workspaces')).rows; for (const w of wss) await discover({ max: 8, poolCap: 20, maxAreas: 8, mode, wsId: w.id }); return send(res, 200, JSON.stringify({ scheduled: true, workspaces: wss.length, mode })); }
+      catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Scheduled discovery did not complete.' })); }
+    }
+    const u = await currentUser(req);   // manual: needs a session, scoped to the caller's space
+    if (!u) return send(res, 401, JSON.stringify({ error: 'Sign in required.' }));
+    try { return send(res, 200, JSON.stringify(await discover({ mode, wsId: await userWorkspace(u) }))); }
     catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Search did not complete (Rightmove may be rate-limiting). Try again shortly.' })); }
   }
   if (url.pathname === '/api/send-weekly' && req.method === 'POST') {
@@ -904,27 +1014,32 @@ createServer(async (req, res) => {
     catch (e) { return send(res, 200, JSON.stringify({ sent: 0, error: String(e && e.message || e) })); }
   }
   if (url.pathname === '/api/regeocode' && req.method === 'POST') {
-    try { return send(res, 200, JSON.stringify(await refineLocations())); }
+    try { return send(res, 200, JSON.stringify(await refineLocations(req.wsId))); }
     catch (e) { return send(res, 200, JSON.stringify({ updated: 0, error: String(e && e.message || e) })); }
   }
+  const settingsPayload = async () => ({
+    searchDistricts: await getSearchDistricts(req.wsId), destinations: await getDestinations(req.wsId),
+    emails: await wsGet(req.wsId, 'emails', []), briefs: await getBriefs(req.wsId), allowedUsers: await getAllowed(),
+    space: { id: req.wsId, name: await workspaceName(req.wsId), people: await workspacePeople(req.wsId) }, you: normEmail(req.user.email),
+  });
   if (url.pathname === '/api/settings' && req.method === 'GET')
-    return send(res, 200, JSON.stringify({ searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []), briefs: await getBriefs(), allowedUsers: await getAllowed() }));
+    return send(res, 200, JSON.stringify(await settingsPayload()));
   if (url.pathname === '/api/settings' && req.method === 'PUT') {
     let body = ''; for await (const chunk of req) body += chunk;
     try {
-      const b = JSON.parse(body || '{}');
-      if (Array.isArray(b.searchDistricts)) await setSetting('search_districts', [...new Set(b.searchDistricts.filter(x => /^[A-Z]{1,2}\d[A-Z\d]?$/i.test(x)).map(x => x.toUpperCase()))].slice(0, 60));
+      const b = JSON.parse(body || '{}'), ws = req.wsId;
+      if (Array.isArray(b.searchDistricts)) await wsSet(ws, 'search_districts', [...new Set(b.searchDistricts.filter(x => /^[A-Z]{1,2}\d[A-Z\d]?$/i.test(x)).map(x => x.toUpperCase()))].slice(0, 60));
       if (Array.isArray(b.destinations)) {
         const clean = b.destinations
           .filter(d => d && d.name && /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/i.test(String(d.postcode).trim()))
           .map(d => ({ name: String(d.name).slice(0, 40).trim(), postcode: String(d.postcode).toUpperCase().replace(/\s+/g, ' ').trim() }))
           .slice(0, 6);
-        await setSetting('destinations', clean);
-        refreshCommutes().catch(() => {}); // recompute in the background
+        await wsSet(ws, 'destinations', clean);
+        refreshCommutes(ws).catch(() => {}); // recompute this workspace's commutes in the background
       }
-      if (Array.isArray(b.emails)) await setSetting('emails', b.emails.filter(e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e))).map(e => String(e).toLowerCase()).slice(0, 6));
+      if (Array.isArray(b.emails)) await wsSet(ws, 'emails', b.emails.filter(e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e))).map(e => String(e).toLowerCase()).slice(0, 6));
       if (b.briefs && typeof b.briefs === 'object') {
-        const cur = await getBriefs();
+        const cur = await getBriefs(ws);
         for (const m of ['buy', 'rent']) {
           const src = b.briefs[m]; if (!src || typeof src !== 'object') continue;
           const out = { ...cur[m] };
@@ -933,18 +1048,19 @@ createServer(async (req, res) => {
           if (Array.isArray(src.beds)) out.beds = [...new Set(src.beds.map(Number).filter(n => n >= 0 && n <= 6))].sort((a, b) => a - b);
           cur[m] = out;
         }
-        await setSetting('briefs', cur);
+        await wsSet(ws, 'briefs', cur);
       }
-      if (Array.isArray(b.allowedUsers)) {
+      if (Array.isArray(b.allowedUsers)) {   // global "who can sign in at all"
         const clean = b.allowedUsers
           .filter(u => u && validEmail(normEmail(u.email)))
           .map(u => ({ email: normEmail(u.email), name: String(u.name || '').trim().slice(0, 40) || normEmail(u.email).split('@')[0] }));
-        // de-dupe by email; always keep the signed-in user so nobody can lock themselves out
         const byEmail = new Map(clean.map(u => [u.email, u]));
-        if (req.user && !byEmail.has(normEmail(req.user.email))) byEmail.set(normEmail(req.user.email), { email: normEmail(req.user.email), name: req.user.name });
-        await setSetting('allowed_users', [...byEmail.values()].slice(0, 20));
+        if (!byEmail.has(normEmail(req.user.email))) byEmail.set(normEmail(req.user.email), { email: normEmail(req.user.email), name: req.user.name });
+        await setSetting('allowed_users', [...byEmail.values()].slice(0, 50));
       }
-      return send(res, 200, JSON.stringify({ ok: true, searchDistricts: await getSearchDistricts(), destinations: await getDestinations(), emails: await getSetting('emails', []), briefs: await getBriefs(), allowedUsers: await getAllowed() }));
+      if (typeof b.spaceName === 'string' && b.spaceName.trim()) await db.execute({ sql: 'UPDATE workspaces SET name=? WHERE id=?', args: [b.spaceName.trim().slice(0, 60), ws] });
+      if (Array.isArray(b.spacePeople)) await reconcileSpacePeople(ws, req.user, b.spacePeople);
+      return send(res, 200, JSON.stringify({ ok: true, ...(await settingsPayload()) }));
     } catch { return send(res, 400, JSON.stringify({ error: 'Invalid settings' })); }
   }
   if (url.pathname === '/api/properties' && req.method === 'POST') {
@@ -952,13 +1068,16 @@ createServer(async (req, res) => {
     try {
       const { url: listingUrl } = JSON.parse(body || '{}');
       if (!listingUrl) return send(res, 400, JSON.stringify({ error: 'No link provided.' }));
-      const result = await addListing(listingUrl);
+      const result = await addListing(listingUrl, { wsId: req.wsId });
       return send(res, result.error ? 422 : 200, JSON.stringify(result));
     } catch (e) { return send(res, 400, JSON.stringify({ error: 'Could not add that link.' })); }
   }
   const del = url.pathname.match(/^\/api\/properties\/([^/]+)$/);
   if (del && req.method === 'DELETE') {
     const id = del[1];
+    // Only a home in the caller's own workspace can be removed.
+    const owned = (await db.execute({ sql: 'SELECT 1 FROM properties WHERE id=? AND workspace_id=?', args: [id, req.wsId] })).rows[0];
+    if (!owned) return send(res, 404, JSON.stringify({ error: 'No such home.' }));
     for (const t of ['feedback', 'insights', 'media', 'commutes', 'guest_notes']) await db.execute({ sql: `DELETE FROM ${t} WHERE property_id=?`, args: [id] });
     await db.execute({ sql: 'DELETE FROM properties WHERE id=?', args: [id] });
     return send(res, 200, JSON.stringify({ ok: true }));
@@ -970,6 +1089,9 @@ createServer(async (req, res) => {
     try {
       const { verdict, note } = JSON.parse(body);
       if (!['Love', 'View', 'Watch', 'Pass', null].includes(verdict)) throw new Error('verdict');
+      // A verdict can only be left on a home in the caller's own workspace.
+      const owned = (await db.execute({ sql: 'SELECT 1 FROM properties WHERE id=? AND workspace_id=?', args: [match[1], req.wsId] })).rows[0];
+      if (!owned) return send(res, 404, JSON.stringify({ error: 'No such home.' }));
       const person = req.user.name;   // reactions are attributed to the signed-in user, never the client
       await db.execute({
         sql: `INSERT INTO feedback(property_id,person,verdict,note,updated_at) VALUES(?,?,?,?,?)
@@ -987,7 +1109,7 @@ createServer(async (req, res) => {
       const { name, body: text } = JSON.parse(body || '{}');
       const nm = String(name || '').trim().slice(0, 40), bd = String(text || '').trim().slice(0, 600);
       if (!nm || !bd) return send(res, 400, JSON.stringify({ error: 'Name and note are both required.' }));
-      const exists = (await db.execute({ sql: 'SELECT 1 FROM properties WHERE id=?', args: [gn[1]] })).rows[0];
+      const exists = (await db.execute({ sql: 'SELECT 1 FROM properties WHERE id=? AND workspace_id=?', args: [gn[1], req.wsId] })).rows[0];
       if (!exists) return send(res, 404, JSON.stringify({ error: 'No such home.' }));
       await db.execute({ sql: 'INSERT INTO guest_notes(property_id,name,body,created_at) VALUES(?,?,?,?)', args: [gn[1], nm, bd, new Date().toISOString()] });
       return send(res, 200, JSON.stringify({ ok: true }));
@@ -995,7 +1117,8 @@ createServer(async (req, res) => {
   }
   const gd = url.pathname.match(/^\/api\/guest-notes\/(\d+)$/);
   if (gd && req.method === 'DELETE') {
-    await db.execute({ sql: 'DELETE FROM guest_notes WHERE rowid=?', args: [+gd[1]] });
+    // Only delete a note attached to a home in the caller's workspace.
+    await db.execute({ sql: 'DELETE FROM guest_notes WHERE rowid=? AND property_id IN (SELECT id FROM properties WHERE workspace_id=?)', args: [+gd[1], req.wsId] });
     return send(res, 200, JSON.stringify({ ok: true }));
   }
   const file = staticFile(url.pathname);
@@ -1015,10 +1138,9 @@ createServer(async (req, res) => {
   try { console.log('Fetching listing galleries…'); await bootstrapMedia(); console.log('Galleries ready.'); }
   catch (e) { console.log('Gallery bootstrap skipped:', e && e.message); }
   try {
-    const dests = await getDestinations();
     const have = (await db.execute('SELECT COUNT(*) AS n FROM commutes')).rows[0].n;
     const total = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
-    if (dests.length && have < total) { console.log('Computing commute times…'); await refreshCommutes(); console.log('Commutes ready.'); }
+    if (have < total) { console.log('Computing commute times…'); await refreshCommutes(); console.log('Commutes ready.'); }
   } catch (e) { console.log('Commute bootstrap skipped:', e && e.message); }
 })();
 

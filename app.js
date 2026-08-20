@@ -15,6 +15,8 @@ let allProperties = [];   // every home from the server (both buy and rent)
 let properties = [];      // current-mode slice — everything downstream reads this
 let selectedId = null;
 let currentUser = null;   // the signed-in user ({id,email,name}); ui.person = their name
+let currentWorkspace = null;  // { id, name } — this user's household space
+let spacePeople = [];     // members + pending invites of the current space
 let map, markers = {};
 let galShots = [], galIndex = 0;  // current gallery images for the full-screen viewer
 let districtLayer = null, selectedDistricts = new Set(), areaMode = false, saveDistTimer;
@@ -315,13 +317,15 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
   renderModeChrome();
   updateAreaToggle();
   showDistricts();   // always render a faint shade for the selected areas
   renderDestChips();
   renderEmailChips();
   renderAllowChips();
+  renderSpaceBox();
+  renderUserChip();
 }
 function renderDestChips() {
   const box = document.getElementById('destChips');
@@ -393,6 +397,52 @@ function addAllow() {
   renderAllowChips(); saveAllowed(`${name || email} can now sign in — send them the site link and they’ll get a magic link by email.`);
 }
 function removeAllow(i) { allowedUsers.splice(i, 1); renderAllowChips(); saveAllowed('Removed.'); }
+
+// ---- people in this space (share the shortlist) --------------------------
+function renderSpaceBox() {
+  const label = document.getElementById('spaceNameLabel');
+  if (label) label.textContent = currentWorkspace ? currentWorkspace.name : 'your space';
+  const nameInput = document.getElementById('spaceNameInput');
+  if (nameInput && document.activeElement !== nameInput) nameInput.value = currentWorkspace ? currentWorkspace.name : '';
+  const box = document.getElementById('spaceChips');
+  if (!box) return;
+  const you = (currentUser && currentUser.email || '').toLowerCase();
+  box.innerHTML = spacePeople.length
+    ? spacePeople.map((p, i) => {
+        const isYou = p.email.toLowerCase() === you;
+        const tag = isYou ? ' (you)' : p.joined ? '' : ' · pending';
+        return `<span class="dest-chip">${esc(p.name)}${tag} · ${esc(p.email)}${isYou ? '' : `<button data-i="${i}" aria-label="Remove ${esc(p.email)}">×</button>`}</span>`;
+      }).join('')
+    : '<span class="dest-empty">Just you so far.</span>';
+  box.querySelectorAll('button[data-i]').forEach(b => b.onclick = () => removeSpacePerson(+b.dataset.i));
+}
+async function saveSpacePeople(msg) {
+  try {
+    const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ spacePeople: spacePeople.map(p => ({ email: p.email, name: p.name })) }) })).json();
+    if (s.space) { spacePeople = s.space.people || []; currentWorkspace = { id: s.space.id, name: s.space.name }; }
+    if (s.allowedUsers) allowedUsers = s.allowedUsers;
+    renderSpaceBox(); renderAllowChips(); renderUserChip();
+  } catch { }
+  const st = document.getElementById('spaceStatus'); if (st && msg) st.textContent = msg;
+}
+function addSpacePerson() {
+  const nEl = document.getElementById('spacePersonName'), eEl = document.getElementById('spacePersonEmail');
+  const name = (nEl.value || '').trim(), email = (eEl.value || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { eEl.focus(); return; }
+  if (!spacePeople.some(p => p.email.toLowerCase() === email)) spacePeople.push({ email, name: name || email.split('@')[0], joined: false });
+  nEl.value = ''; eEl.value = '';
+  renderSpaceBox(); saveSpacePeople(`${name || email} can now open this space — send them the site link to sign in.`);
+}
+function removeSpacePerson(i) { spacePeople.splice(i, 1); renderSpaceBox(); saveSpacePeople('Removed from this space.'); }
+async function renameSpace() {
+  const el = document.getElementById('spaceNameInput'); const v = (el.value || '').trim();
+  if (!v || (currentWorkspace && v === currentWorkspace.name)) return;
+  try {
+    const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ spaceName: v }) })).json();
+    if (s.space) currentWorkspace = { id: s.space.id, name: s.space.name };
+    renderSpaceBox(); renderUserChip();
+  } catch { }
+}
 function districtStyle(name) {
   const on = selectedDistricts.has(name);
   if (!areaMode) return on ? { fill: true, fillColor: '#285b43', fillOpacity: 0.1, color: '#5d9b75', weight: 1, opacity: 0.5 } : { fill: false, stroke: false };
@@ -747,8 +797,9 @@ function renderLeadNote() {
 
 // ---- sign-in / identity --------------------------------------------------
 function renderUserChip() {
-  const chip = document.getElementById('userChip'), name = document.getElementById('userName');
+  const chip = document.getElementById('userChip'), name = document.getElementById('userName'), space = document.getElementById('spaceNameChip');
   if (name) name.textContent = currentUser ? currentUser.name : '';
+  if (space) space.textContent = currentWorkspace ? currentWorkspace.name : '';
   if (chip) chip.hidden = !currentUser;
 }
 async function logout() {
@@ -894,6 +945,9 @@ function bind() {
   document.getElementById('logoutBtn')?.addEventListener('click', logout);
   document.getElementById('allowAdd')?.addEventListener('click', addAllow);
   document.getElementById('allowEmail')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addAllow(); } });
+  document.getElementById('spaceAdd')?.addEventListener('click', addSpacePerson);
+  document.getElementById('spacePersonEmail')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addSpacePerson(); } });
+  document.getElementById('spaceNameInput')?.addEventListener('change', renameSpace);
   document.querySelectorAll('#modeSwitch button').forEach(b => b.onclick = () => switchMode(b.dataset.mode));
   document.getElementById('moveFrom')?.addEventListener('change', e => setMoveWindow('moveFrom', e.target.value));
   document.getElementById('moveTo')?.addEventListener('change', e => setMoveWindow('moveTo', e.target.value));
@@ -934,7 +988,7 @@ function bind() {
   // Gate on a session first — no login, show the sign-in screen and stop.
   const me = await fetch('/api/me', { cache: 'no-store' }).then(r => r.json()).catch(() => ({ user: null }));
   if (!me.user) { showLogin(); return; }
-  currentUser = me.user; ui.person = currentUser.name; saveUi();
+  currentUser = me.user; currentWorkspace = me.workspace || null; ui.person = currentUser.name; saveUi();
   document.getElementById('loginScreen').hidden = true;
   document.getElementById('top').hidden = false;
   renderUserChip();

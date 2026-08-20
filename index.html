@@ -22,6 +22,8 @@
       <div class="whoami" id="userChip" hidden>
         <span>Signed in as</span>
         <b id="userName"></b>
+        <span class="chip-sep" id="spaceChipSep">·</span>
+        <span id="spaceNameChip" class="space-chip"></span>
         <button type="button" id="logoutBtn" class="quiet-button">Log out</button>
       </div>
       <button id="briefButton" class="quiet-button">Your brief <span>→</span></button>
@@ -145,11 +147,23 @@
       </div>
     </section>
 
+    <section class="dest-bar" aria-label="People in this space">
+      <div class="dest-head"><strong>People in <span id="spaceNameLabel">your space</span></strong><span>Share your shortlist — they see and react to the same homes.</span></div>
+      <div class="space-rename"><label>Space name <input id="spaceNameInput" type="text" maxlength="60" placeholder="Our home search" /></label></div>
+      <div id="spaceChips" class="dest-chips"></div>
+      <div class="dest-add">
+        <input id="spacePersonName" type="text" placeholder="Name (e.g. Hannah)" maxlength="40" />
+        <input id="spacePersonEmail" type="email" placeholder="their@email.com" />
+        <button type="button" id="spaceAdd" class="lead-btn ghost">+ Add</button>
+      </div>
+      <p id="spaceStatus" class="add-status"></p>
+    </section>
+
     <section class="dest-bar" aria-label="Who can sign in">
-      <div class="dest-head"><strong>People who can sign in</strong><span>Only these emails can request a sign-in link. Add someone to give them access.</span></div>
+      <div class="dest-head"><strong>People who can sign in</strong><span>Anyone here can sign in. Someone added here but <em>not</em> to a space above gets their own separate shortlist.</span></div>
       <div id="allowChips" class="dest-chips"></div>
       <div class="dest-add">
-        <input id="allowName" type="text" placeholder="Name (e.g. Hannah)" maxlength="40" />
+        <input id="allowName" type="text" placeholder="Name" maxlength="40" />
         <input id="allowEmail" type="email" placeholder="their@email.com" />
         <button type="button" id="allowAdd" class="lead-btn ghost">+ Allow</button>
       </div>

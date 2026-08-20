@@ -20,6 +20,10 @@ in 20 minutes). Sessions last 30 days in a secure cookie.
   Add others (e.g. Hannah) in the app under **"People who can sign in"** — set the name to
   match their past verdicts (e.g. "Hannah") so their history lines up.
 - **Your verdicts** are attributed to whoever is signed in (no more Ralf/Hannah toggle).
+- **Separate spaces per household:** each account is in its own private workspace and only
+  sees that space's homes. To share your shortlist (e.g. with your partner) add them under
+  **"People in this space"** — they'll see and react to the same homes. Someone allow-listed
+  but not added to a space gets their own separate shortlist. Rename your space there too.
 - **Local dev without SendGrid:** the sign-in link is shown on screen so you can click
   straight through — no email needed.
 - Sending links in production uses the same SendGrid sender as the weekly email

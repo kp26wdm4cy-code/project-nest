@@ -34,13 +34,32 @@ below note what's done vs. still to come.
 - Off by default: the button only appears when `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`
   are set. See the README for the one-time Google Cloud setup.
 
-## Still to come (phases 2–3, NOT built)
+## Also built (Phase 2 — per-household workspaces)
 
-- **Per-household data separation** (workspaces + `workspace_id` scoping on every query) so
-  different couples get their own private shortlists — see the model + risks below.
-- **Email invitations** with links (today's allow-list is add-by-email, no invite email).
-- Roles, account management, delete-account, multi-workspace switching, and authenticated
-  per-workspace cron runs.
+Nest is now **multi-tenant**: each household has its own isolated space.
+
+- Tables `workspaces`, `memberships`, `invites`, `ws_settings`; `properties` carries a
+  `workspace_id`. A one-time migration put all existing data in one default space
+  ("Ralf & Hannah"), copied its settings across, and seeded its membership from the
+  allow-list. On sign-in, `userWorkspace()` returns your membership, else a pending invite
+  you now accept, else a brand-new private space of your own.
+- **Every user-facing query is scoped to the caller's workspace** — reads (`rows`, export)
+  and writes (add, delete, feedback, notes) all filter by `workspace_id`, and cross-space
+  reads/writes are rejected. Verified with a two-tenant isolation test (a second user sees
+  0 homes, gets 404 trying to touch the first user's homes; an invited user shares the
+  space). Per-workspace settings (search areas, destinations, subscribers, briefs) live in
+  `ws_settings`. Background crons (discover, weekly email, commutes) iterate workspaces.
+- **Sharing** via "People in this space" (per-workspace members + invites); adding someone
+  also allow-lists them so they can sign in. Space rename supported. The global "People who
+  can sign in" list still gates sign-in overall; someone allow-listed but not invited to a
+  space gets their own.
+
+## Still to come (phase 3, NOT built)
+
+- **Emailed invitations** (today's invite adds the email to the roster; it doesn't send a
+  "you've been invited" email — the person just signs in normally).
+- Roles/permissions beyond owner/member, account rename, delete-account, and switching
+  between multiple spaces you belong to.
 
 ---
 
