@@ -9,6 +9,7 @@ ui.filter ||= 'queue';
 ui.mode = MODES.includes(ui.mode) ? ui.mode : 'buy';   // Buy vs Rent — a top-level view switch
 ui.moveFrom ||= '';    // move-in window filter (ISO dates, '' = open)
 ui.moveTo ||= '';
+ui.compareOpen ??= false;   // smart keeper comparison panel open/closed
 const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 
 let allProperties = [];   // every home from the server (both buy and rent)
@@ -937,9 +938,108 @@ function removeProperty(p) {
     .catch(() => {});
 }
 
+// ---- smart compare of keepers --------------------------------------------
+const cmpSqm = p => { const m = String(p.size || '').match(/([\d.]+)\s*(?:sq\s*m|sqm|m²|m2)/i); return m ? +m[1] : null; };
+const cmpPpsqm = p => { const s = cmpSqm(p); return s ? Math.round(p.price / s) : null; };
+const cmpCommute = p => { const t = (p.commutes || []).map(c => c.minutes).filter(n => n != null); return t.length ? Math.round(t.reduce((a, b) => a + b, 0) / t.length) : null; };
+const cmpScore = (p, k) => (p.insights && p.insights.scores && p.insights.scores[k] != null) ? p.insights.scores[k] : null;
+const cmpCompsPct = p => { const c = p.insights && p.insights.comps; return (c && c.median && p.price) ? Math.round((p.price / c.median - 1) * 100) : null; };
+const cmpLikes = p => (p.feedback || []).filter(f => ['Love', 'View'].includes(f.verdict));
+const cmpShort = p => (p.name || '').split(',')[0].trim();
+
+function computeFit(keepers) {
+  const b = briefs[ui.mode] || {};
+  const budget = b.maxPrice || Math.max(...keepers.map(p => p.price));
+  const metrics = [
+    { w: 1.5, val: p => budget ? (budget - p.price) / budget : null },       // more under budget
+    { w: 1.5, val: p => { const v = cmpPpsqm(p); return v != null ? -v : null; } }, // lower £/m²
+    { w: 1.0, val: p => cmpSqm(p) },                                          // bigger
+    { w: 1.0, val: p => cmpScore(p, 'Transport') },
+    { w: 0.7, val: p => cmpScore(p, 'Green space') },
+    { w: 0.7, val: p => cmpScore(p, 'Amenities') },
+    { w: 1.0, val: p => cmpScore(p, 'Value') },
+    { w: 1.2, val: p => { const v = cmpCommute(p); return v != null ? -v : null; } }, // shorter commute
+    { w: 1.0, val: p => { const v = cmpCompsPct(p); return v != null ? -v : null; } }, // below local median
+  ];
+  const norm = metrics.map(m => {
+    const vals = keepers.map(m.val), present = vals.filter(v => v != null);
+    if (!present.length) return keepers.map(() => 0.5);
+    const lo = Math.min(...present), hi = Math.max(...present);
+    return vals.map(v => v == null ? 0.5 : (hi === lo ? 0.5 : (v - lo) / (hi - lo)));
+  });
+  const totW = metrics.reduce((a, m) => a + m.w, 0);
+  return keepers.map((p, i) => {
+    let s = 0; metrics.forEach((m, mi) => s += m.w * norm[mi][i]);
+    let score = (s / totW) * 100;
+    if (cmpLikes(p).length >= 2) score += 4;   // you both like it
+    return Math.round(Math.max(0, Math.min(100, score)));
+  });
+}
+function keepersForCompare() { return properties.filter(p => ['Love', 'View', 'Watch'].includes(statusOf(p))).slice(0, 6); }
+function renderCompare() {
+  const section = document.getElementById('compareSection'), body = document.getElementById('compareBody'), toggle = document.getElementById('compareToggle');
+  if (!section) return;
+  const ks = keepersForCompare();
+  if (ks.length < 2) { section.hidden = true; if (body) body.innerHTML = ''; return; }
+  section.hidden = false;
+  if (toggle) toggle.textContent = ui.compareOpen ? 'Hide ▴' : `Compare ${ks.length} keepers ▾`;
+  if (!ui.compareOpen) { body.innerHTML = ''; return; }
+
+  const fit = computeFit(ks);
+  const topIdx = fit.indexOf(Math.max(...fit));
+  const rent = ui.mode === 'rent';
+  // rows: {label, cell(p)->html, num(p)->number|null, better:'low'|'high'|null}
+  const rows = [
+    { label: 'Fit score', cell: (p, i) => `<b>${fit[i]}</b>`, num: (p, i) => fit[i], better: 'high', head: true },
+    { label: rent ? 'Rent' : 'Price', cell: p => priceLabel(p), num: p => p.price, better: 'low' },
+    { label: '£ / m²', cell: p => { const v = cmpPpsqm(p); return v ? '£' + v.toLocaleString('en-GB') : '—'; }, num: p => cmpPpsqm(p), better: 'low' },
+    { label: 'Size', cell: p => { const v = cmpSqm(p); return v ? v + ' m²' : '—'; }, num: p => cmpSqm(p), better: 'high' },
+    { label: 'Beds', cell: p => p.bedrooms || '—', num: null, better: null },
+    { label: 'Avg commute', cell: p => { const v = cmpCommute(p); return v != null ? v + ' min' : '—'; }, num: p => cmpCommute(p), better: 'low' },
+    { label: 'Transport', cell: p => cmpScore(p, 'Transport') ?? '—', num: p => cmpScore(p, 'Transport'), better: 'high' },
+    { label: 'Green space', cell: p => cmpScore(p, 'Green space') ?? '—', num: p => cmpScore(p, 'Green space'), better: 'high' },
+    { label: 'Amenities', cell: p => cmpScore(p, 'Amenities') ?? '—', num: p => cmpScore(p, 'Amenities'), better: 'high' },
+    { label: 'Area value', cell: p => cmpScore(p, 'Value') ?? '—', num: p => cmpScore(p, 'Value'), better: 'high' },
+    ...(rent ? [] : [{ label: 'vs local median', cell: p => { const v = cmpCompsPct(p); return v == null ? '—' : (v > 0 ? '+' : '') + v + '%'; }, num: p => cmpCompsPct(p), better: 'low' }]),
+    ...(rent ? [] : [{ label: 'Tenure', cell: p => p.tenure ? esc(p.tenure) + (p.lease_years ? ` · ${p.lease_years}y` : '') : '—', num: null, better: null }]),
+    { label: 'Available', cell: p => availWhen(p) || '—', num: null, better: null },
+    { label: 'Who likes it', cell: p => cmpLikes(p).map(f => esc(f.person)).join(', ') || '—', num: null, better: null },
+  ];
+  const headCells = ks.map((p, i) => `<th class="${i === topIdx ? 'cmp-top' : ''}"><button class="cmp-h" data-id="${p.id}"><span class="cmp-name">${esc(cmpShort(p))}</span><span class="cmp-price">${priceLabel(p)}</span></button></th>`).join('');
+  const rowHtml = rows.map(r => {
+    const nums = r.num ? ks.map((p, i) => r.num(p, i)) : null;
+    let best = -1, worst = -1;
+    if (nums) {
+      const present = nums.map((v, i) => [v, i]).filter(x => x[0] != null);
+      if (present.length >= 2 && r.better) {
+        const sorted = present.slice().sort((a, b) => a[0] - b[0]);
+        best = (r.better === 'low' ? sorted[0] : sorted[sorted.length - 1])[1];
+        worst = (r.better === 'low' ? sorted[sorted.length - 1] : sorted[0])[1];
+      }
+    }
+    const cells = ks.map((p, i) => `<td class="${i === best ? 'cmp-best' : ''} ${i === worst ? 'cmp-worst' : ''} ${i === topIdx ? 'cmp-topcol' : ''}">${r.cell(p, i)}</td>`).join('');
+    return `<tr class="${r.head ? 'cmp-fitrow' : ''}"><th scope="row">${r.label}</th>${cells}</tr>`;
+  }).join('');
+
+  // smart read
+  const byMin = (fn) => { let bi = -1, bv = Infinity; ks.forEach((p, i) => { const v = fn(p); if (v != null && v < bv) { bv = v; bi = i; } }); return bi; };
+  const byMax = (fn) => { let bi = -1, bv = -Infinity; ks.forEach((p, i) => { const v = fn(p); if (v != null && v > bv) { bv = v; bi = i; } }); return bi; };
+  const valueIdx = byMin(cmpPpsqm), connIdx = byMin(cmpCommute) >= 0 ? byMin(cmpCommute) : byMax(p => cmpScore(p, 'Transport')), roomIdx = byMax(cmpSqm);
+  const bits = [`<b>Best all-rounder:</b> ${esc(cmpShort(ks[topIdx]))} (fit ${fit[topIdx]})`];
+  if (valueIdx >= 0) bits.push(`<b>Best value:</b> ${esc(cmpShort(ks[valueIdx]))} (£${cmpPpsqm(ks[valueIdx]).toLocaleString('en-GB')}/m²)`);
+  if (connIdx >= 0) bits.push(`<b>Best connected:</b> ${esc(cmpShort(ks[connIdx]))}${cmpCommute(ks[connIdx]) != null ? ` (${cmpCommute(ks[connIdx])} min avg)` : ''}`);
+  if (roomIdx >= 0 && cmpSqm(ks[roomIdx])) bits.push(`<b>Roomiest:</b> ${esc(cmpShort(ks[roomIdx]))} (${cmpSqm(ks[roomIdx])} m²)`);
+  const tradeoff = (valueIdx >= 0 && valueIdx !== topIdx) ? ` <span class="cmp-trade">Trade-off: ${esc(cmpShort(ks[topIdx]))} scores highest overall, but ${esc(cmpShort(ks[valueIdx]))} is better value per m².</span>` : '';
+
+  body.innerHTML = `<p class="cmp-read">${bits.join(' · ')}.${tradeoff}</p>
+    <div class="cmp-scroll"><table class="cmp-table"><thead><tr><th></th>${headCells}</tr></thead><tbody>${rowHtml}</tbody></table></div>
+    <p class="cmp-foot">Fit score weighs value-for-money, £/m², size, transport, green space, amenities, area value, commute and price-vs-local-market — plus a nudge when you both like it. Green = best in its row; a home you both like counts for more.</p>`;
+  body.querySelectorAll('.cmp-h').forEach(b => b.onclick = () => { select(b.dataset.id); document.getElementById('propertyDetail')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+}
+
 function renderAll() {
   renderModeSwitch(); renderModeChrome(); renderMoveFilter();
-  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote();
+  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote(); renderCompare();
 }
 
 function bind() {
@@ -973,6 +1073,7 @@ function bind() {
   if (discoverBtn) discoverBtn.onclick = () => submitDiscover(discoverBtn);
   document.getElementById('areaToggle')?.addEventListener('click', toggleAreas);
   document.getElementById('zoomExtent')?.addEventListener('click', fitToProperties);
+  document.getElementById('compareToggle')?.addEventListener('click', () => { ui.compareOpen = !ui.compareOpen; saveUi(); renderCompare(); });
   document.getElementById('destAdd')?.addEventListener('click', addDest);
   document.getElementById('destPostcode')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addDest(); } });
   document.getElementById('emailAdd')?.addEventListener('click', addEmail);
