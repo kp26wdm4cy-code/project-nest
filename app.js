@@ -516,15 +516,24 @@ function included(p, filter) {
   return false;
 }
 function renderList() {
-  const list = properties.filter(p => included(p, ui.filter));
+  let list = properties.filter(p => included(p, ui.filter));
+  // The "To review" list is ordered best-fit first (same fit score as the compare panel,
+  // computed across the homes on show), so the most promising flats surface at the top.
+  let fitMap = null;
+  if (ui.filter === 'queue' && list.length > 1) {
+    const fit = computeFit(list);
+    fitMap = new Map(list.map((p, i) => [p.id, fit[i]]));
+    list = list.slice().sort((a, b) => fitMap.get(b.id) - fitMap.get(a.id));
+  }
   const box = document.getElementById('propertyList');
   box.innerHTML = list.length ? list.map(p => {
     const others = othersInline(p);
     const av = availInfo(p);
+    const fs = fitMap ? ` · <b class="fitscore" title="Fit score — best-fit first">fit ${fitMap.get(p.id)}</b>` : '';
     return `<button class="property-item ${p.id === selectedId ? 'active' : ''} ${p.recommendation === 'View' ? 'top' : ''}" data-id="${p.id}">
       <div class="item-top"><strong>${p.name}</strong><span class="fit">${p.recommendation === 'View' ? 'VIEW FIRST' : 'WATCH'}</span></div>
       <span>${p.area} · ${priceLabel(p)}${hasDrop(p) ? ` <i class="drop">${dropText(p)}</i>` : ''} · ${p.bedrooms} bed <i class="avail ${av.cls}">${av.text}</i>${availChip(p)}${(p.tags || []).includes('suggested') ? '<i class="sug">✨ Suggested</i>' : ''}</span>
-      <span><i class="status-dot ${markerClass(p)}"></i>${label(statusOf(p))}${others ? ` · <b class="partner">${others}</b>` : ''}</span>
+      <span><i class="status-dot ${markerClass(p)}"></i>${label(statusOf(p))}${fs}${others ? ` · <b class="partner">${others}</b>` : ''}</span>
     </button>`;
   }).join('') : '<p class="empty">Nothing here yet. Switch tab or add a home — verdicts are saved on the shared server.</p>';
   box.querySelectorAll('.property-item').forEach(b => b.onclick = () => select(b.dataset.id));
