@@ -401,7 +401,11 @@ async function discover(opts = {}) {
   const brief = (await getBriefs(wsId))[mode];
   const minPrice = brief.minPrice || (mode === 'rent' ? 500 : 120000);
   const taste = await buildTaste(mode, wsId);
-  const areas = (await getSearchDistricts(wsId)).slice(0, opts.maxAreas || 5);
+  // Sample across the FULL selected search area, not just the first few — shuffle the whole
+  // list so each run covers a different, wider spread of the selected districts.
+  const allAreas = await getSearchDistricts(wsId);
+  const shuffled = allAreas.slice().sort(() => Math.random() - 0.5);
+  const areas = shuffled.slice(0, opts.maxAreas || 12);
   const searchPath = mode === 'rent' ? 'property-to-rent' : 'property-for-sale';
   const existing = new Set((await db.execute({ sql: 'SELECT listing_url FROM properties WHERE workspace_id=?', args: [wsId] })).rows
     .map(r => (String(r.listing_url).match(/(\d{5,})/) || [])[1]).filter(Boolean));
@@ -576,6 +580,7 @@ async function setSetting(key, value) {
   await db.execute({ sql: 'INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', args: [key, JSON.stringify(value)] });
 }
 const DEFAULT_DISTRICTS = ['N1', 'E2', 'E9', 'E3', 'N16', 'N5', 'E8', 'E5']; // Hoxton, Victoria Park, Bow, Stoke Newington, Highbury…
+const DEFAULT_GUARDRAILS = 'Outdoor space preferred. No noisy roads or poor light. No ground floor unless secure/gated. Ex-local authority is considered.';
 const getDestinations = wsId => wsGet(wsId, 'destinations', []);
 
 // --- commute times (TfL Journey Planner) ----------------------------------
@@ -1044,7 +1049,7 @@ createServer(async (req, res) => {
     const scheduled = url.searchParams.get('scheduled') === '1';
     const mode = url.searchParams.get('mode') === 'rent' ? 'rent' : 'buy';
     if (scheduled) {   // cron: discover for every workspace using each one's own brief/areas
-      try { const wss = (await db.execute('SELECT id FROM workspaces')).rows; for (const w of wss) await discover({ max: 8, poolCap: 20, maxAreas: 8, mode, wsId: w.id }); return send(res, 200, JSON.stringify({ scheduled: true, workspaces: wss.length, mode })); }
+      try { const wss = (await db.execute('SELECT id FROM workspaces')).rows; for (const w of wss) await discover({ max: 8, poolCap: 20, maxAreas: 14, mode, wsId: w.id }); return send(res, 200, JSON.stringify({ scheduled: true, workspaces: wss.length, mode })); }
       catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Scheduled discovery did not complete.' })); }
     }
     const u = await currentUser(req);   // manual: needs a session, scoped to the caller's space
@@ -1065,6 +1070,7 @@ createServer(async (req, res) => {
     return {
       searchDistricts: await getSearchDistricts(req.wsId), destinations: await getDestinations(req.wsId),
       emails: await wsGet(req.wsId, 'emails', []), briefs: await getBriefs(req.wsId),
+      guardrails: await wsGet(req.wsId, 'guardrails', DEFAULT_GUARDRAILS),
       space: { id: req.wsId, name: await workspaceName(req.wsId), people: await workspacePeople(req.wsId) }, you: normEmail(req.user.email),
       isHost: host,
       ...(host ? { allowedUsers: await getAllowed() } : {}),   // the global sign-in list is host-only
@@ -1106,6 +1112,7 @@ createServer(async (req, res) => {
         if (!byEmail.has(normEmail(req.user.email))) byEmail.set(normEmail(req.user.email), { email: normEmail(req.user.email), name: req.user.name });
         await setSetting('allowed_users', [...byEmail.values()].slice(0, 50));
       }
+      if (typeof b.guardrails === 'string') await wsSet(ws, 'guardrails', b.guardrails.trim().slice(0, 400));
       if (typeof b.spaceName === 'string' && b.spaceName.trim()) await db.execute({ sql: 'UPDATE workspaces SET name=? WHERE id=?', args: [b.spaceName.trim().slice(0, 60), ws] });
       let invited = 0;
       if (Array.isArray(b.spacePeople)) {

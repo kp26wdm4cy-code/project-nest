@@ -10,6 +10,7 @@ ui.mode = MODES.includes(ui.mode) ? ui.mode : 'buy';   // Buy vs Rent — a top-
 ui.moveFrom ||= '';    // move-in window filter (ISO dates, '' = open)
 ui.moveTo ||= '';
 ui.compareOpen ??= false;   // smart keeper comparison panel open/closed
+ui.collapsed ||= {};        // collapsed state of the bottom settings blocks (default collapsed)
 const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 
 let allProperties = [];   // every home from the server (both buy and rent)
@@ -25,6 +26,7 @@ let destinations = [], subscribedEmails = [];
 let briefs = { buy: { maxPrice: 550000, minPrice: 120000, beds: [1, 2] }, rent: { maxPrice: 2500, minPrice: 800, beds: [1, 2] } };
 let allowedUsers = [];   // emails permitted to sign in ({email,name}) — host only
 let isHost = false;      // whether the signed-in user administers the global sign-in list
+let guardrails = 'Outdoor space preferred. No noisy roads or poor light. No ground floor unless secure/gated. Ex-local authority is considered.';
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
 // Rentals carry a monthly price; sales an outright price. One label formatter for both.
@@ -319,8 +321,9 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
   renderModeChrome();
+  renderGuardrails();
   updateAreaToggle();
   showDistricts();   // always render a faint shade for the selected areas
   renderDestChips();
@@ -328,6 +331,22 @@ async function loadSettings() {
   renderAllowChips();
   renderSpaceBox();
   renderUserChip();
+}
+// Collapsible bottom blocks (commute, sharing, sign-in, weekly email) — collapsed by
+// default, remembered per block, with a Show/Hide toggle in the header (like Compare).
+function initCollapsibles() {
+  document.querySelectorAll('.dest-bar.collapsible').forEach(sec => {
+    const head = sec.querySelector('.dest-head');
+    if (!head || head.querySelector('.sec-toggle')) return;
+    const key = sec.id || sec.getAttribute('aria-label');
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'sec-toggle quiet-button';
+    const paint = () => { const c = sec.classList.contains('collapsed'); btn.textContent = c ? 'Show ▾' : 'Hide ▴'; };
+    sec.classList.toggle('collapsed', ui.collapsed[key] !== false);   // default collapsed
+    paint();
+    btn.onclick = () => { const c = !sec.classList.contains('collapsed'); sec.classList.toggle('collapsed', c); ui.collapsed[key] = c; saveUi(); paint(); };
+    head.appendChild(btn);
+  });
 }
 function renderDestChips() {
   const box = document.getElementById('destChips');
@@ -759,12 +778,18 @@ function renderModeChrome() {
   const disc = document.getElementById('discoverBtn');
   if (disc) { disc.disabled = false; disc.title = ''; disc.textContent = ui.mode === 'rent' ? '✨ Suggest rentals that fit us' : '✨ Suggest homes that fit us'; }
 }
+function renderGuardrails() {
+  const el = document.getElementById('briefGuardrails');
+  if (el && guardrails) el.textContent = guardrails;
+}
 function openBriefEditor() {
   const ed = document.getElementById('briefEditor'); if (!ed) return;
   const b = briefs[ui.mode] || {};
+  document.getElementById('briefMinPrice').value = b.minPrice || '';
   document.getElementById('briefMaxPrice').value = b.maxPrice || '';
-  document.getElementById('briefPriceUnit').textContent = ui.mode === 'rent' ? 'monthly rent (pcm)' : 'price';
+  document.querySelectorAll('.briefPriceUnit').forEach(e => e.textContent = ui.mode === 'rent' ? 'rent (pcm)' : 'price');
   document.querySelectorAll('#briefBeds input').forEach(c => c.checked = (b.beds || []).includes(+c.value));
+  document.getElementById('briefGuardrailsInput').value = guardrails || '';
   document.getElementById('briefEditStatus').textContent = '';
   ed.hidden = false;
   document.getElementById('briefEdit')?.setAttribute('aria-expanded', 'true');
@@ -775,15 +800,18 @@ function closeBriefEditor() {
 }
 async function saveBrief() {
   const status = document.getElementById('briefEditStatus');
+  const minPrice = Math.max(0, Math.round(+document.getElementById('briefMinPrice').value || 0));
   const maxPrice = Math.max(0, Math.round(+document.getElementById('briefMaxPrice').value || 0));
   const beds = [...document.querySelectorAll('#briefBeds input:checked')].map(c => +c.value);
+  const guard = (document.getElementById('briefGuardrailsInput').value || '').trim();
   if (!maxPrice) { if (status) status.textContent = 'Enter a max ' + (ui.mode === 'rent' ? 'monthly rent.' : 'price.'); return; }
-  briefs[ui.mode] = { ...briefs[ui.mode], maxPrice, beds };
+  briefs[ui.mode] = { ...briefs[ui.mode], minPrice, maxPrice, beds };
   if (status) status.textContent = 'Saving…';
   try {
-    const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ briefs }) })).json();
+    const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ briefs, guardrails: guard }) })).json();
     if (s.briefs) briefs = s.briefs;
-    renderModeChrome();
+    if (s.guardrails != null) guardrails = s.guardrails;
+    renderModeChrome(); renderGuardrails();
     if (status) status.textContent = `Saved — “Suggest ${ui.mode === 'rent' ? 'rentals' : 'homes'}” will use this.`;
     setTimeout(closeBriefEditor, 1100);
   } catch { if (status) status.textContent = 'Could not save — is the server running?'; }
@@ -1083,6 +1111,7 @@ function bind() {
   document.getElementById('areaToggle')?.addEventListener('click', toggleAreas);
   document.getElementById('zoomExtent')?.addEventListener('click', fitToProperties);
   document.getElementById('compareToggle')?.addEventListener('click', () => { ui.compareOpen = !ui.compareOpen; saveUi(); renderCompare(); });
+  initCollapsibles();
   document.getElementById('destAdd')?.addEventListener('click', addDest);
   document.getElementById('destPostcode')?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addDest(); } });
   document.getElementById('emailAdd')?.addEventListener('click', addEmail);

@@ -3,7 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Nest — Ralf & Hannah's home scout</title>
+  <title>MyNest — home scout</title>
+  <meta property="og:title" content="MyNest — home scout" />
+  <meta property="og:description" content="Your shared home shortlist — react, compare and decide together." />
+  <meta property="og:type" content="website" />
+  <meta name="description" content="MyNest — a shared home shortlist you react to, compare and decide on together." />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap" rel="stylesheet">
@@ -117,7 +121,10 @@
           <button type="button" id="briefEdit" class="brief-edit" aria-expanded="false" aria-controls="briefEditor">Edit</button>
         </div>
         <div id="briefEditor" class="brief-editor" hidden>
-          <label class="be-price">Max <span id="briefPriceUnit">price</span>
+          <label class="be-price">Min <span class="briefPriceUnit">price</span>
+            <input id="briefMinPrice" type="number" min="0" step="1000" inputmode="numeric" placeholder="no min" />
+          </label>
+          <label class="be-price">Max <span class="briefPriceUnit">price</span>
             <input id="briefMaxPrice" type="number" min="0" step="1000" inputmode="numeric" />
           </label>
           <div class="be-beds"><span class="be-legend">Bedrooms</span>
@@ -129,23 +136,26 @@
               <label><input type="checkbox" value="4" />4+</label>
             </div>
           </div>
+          <label class="be-guardrails">Guardrails &amp; must-haves
+            <textarea id="briefGuardrailsInput" maxlength="400" placeholder="e.g. Outdoor space preferred. No noisy roads or poor light. No ground floor unless secure."></textarea>
+          </label>
           <div class="be-actions">
             <button type="button" id="briefSave" class="lead-btn">Save brief</button>
             <button type="button" id="briefCancel" class="lead-btn ghost">Cancel</button>
             <span id="briefEditStatus" class="be-status"></span>
           </div>
-          <p class="be-note">Drives the “Suggest…” search and the summary below, for the current Buy/Rent view. Location comes from the map areas; guardrails stay as they are.</p>
+          <p class="be-note">Price range + bedrooms drive the “Suggest…” search and the summary below (per Buy/Rent view). Guardrails are your shared notes, shown under Guardrails. Location comes from the map areas.</p>
         </div>
         <div class="brief-columns">
           <div><strong>Location</strong><p>Based on the search areas you’ve selected on the map above.</p><p class="brief-live" id="briefLeaning"></p></div>
           <div><strong>Home</strong><p id="briefHomeStatic">£450k target; £500k only if exceptional. 1–2 beds, 50m²+, efficient layout, charm and potential.</p><p class="brief-live" id="briefKeepers"></p></div>
-          <div><strong>Guardrails</strong><p>Outdoor space preferred. No noisy roads or poor light. No ground floor unless secure/gated. Ex-local authority is considered.</p></div>
+          <div><strong>Guardrails</strong><p id="briefGuardrails">Outdoor space preferred. No noisy roads or poor light. No ground floor unless secure/gated. Ex-local authority is considered.</p></div>
         </div>
         <p class="brief-foot">This is a working brief, not a cage. Your reactions change it.</p>
       </article>
     </section>
 
-    <section class="dest-bar" aria-label="Commute destinations">
+    <section class="dest-bar collapsible" id="secCommute" aria-label="Commute destinations">
       <div class="dest-head"><strong>Commute check</strong><span>Add places you travel to — Nest shows the transit and cycling time from every home.</span></div>
       <div id="destChips" class="dest-chips"></div>
       <div class="dest-add">
@@ -155,7 +165,7 @@
       </div>
     </section>
 
-    <section class="dest-bar" aria-label="People in this space">
+    <section class="dest-bar collapsible" id="secSpace" aria-label="People in this space">
       <div class="dest-head"><strong>People in <span id="spaceNameLabel">your space</span></strong><span>Share your shortlist — they see and react to the same homes.</span></div>
       <div class="space-rename"><label>Space name <input id="spaceNameInput" type="text" maxlength="60" placeholder="Our home search" /></label></div>
       <div id="spaceChips" class="dest-chips"></div>
@@ -167,7 +177,7 @@
       <p id="spaceStatus" class="add-status"></p>
     </section>
 
-    <section class="dest-bar" id="allowSection" aria-label="Who can sign in" hidden>
+    <section class="dest-bar collapsible" id="allowSection" aria-label="Who can sign in" hidden>
       <div class="dest-head"><strong>People who can sign in</strong><span>Host only. Anyone here can sign in; someone added here but <em>not</em> to a space above gets their own separate shortlist.</span></div>
       <div id="allowChips" class="dest-chips"></div>
       <div class="dest-add">
@@ -178,7 +188,7 @@
       <p id="allowStatus" class="add-status"></p>
     </section>
 
-    <section class="dest-bar" aria-label="Weekly email">
+    <section class="dest-bar collapsible" id="secWeekly" aria-label="Weekly email">
       <div class="dest-head"><strong>Weekly email</strong><span>A Sunday-morning summary of new suggestions and price drops.</span></div>
       <div id="emailChips" class="dest-chips"></div>
       <div class="dest-add">
