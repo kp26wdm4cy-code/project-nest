@@ -32,6 +32,7 @@ let tasteMemory = {};    // taste Nest remembers from cleared listings ({buy,ren
 let archives = [];       // saved snapshots from "Start fresh"
 let lineTarget = { lines: [], minutes: 5 };   // "Near a line": suggest only homes within N min walk of these lines
 let railData = null, catchLayer = null, saveLineTimer;
+let suggestOn = true;     // Nest's suggestions on/off for this space (off = no auto-adds, untouched ones hidden)
 let resetStep = 0;       // 0 = idle, 1 = first warning, 2 = type CLEAR
 let guardrails = 'Outdoor space preferred. No noisy roads or poor light. No ground floor unless secure/gated. Ex-local authority is considered.';
 
@@ -352,6 +353,22 @@ async function renderLineTarget() {
   drawCatchments();
   if (ui.lineHide) refreshReach(); else renderLineNote();
 }
+// Minimum floor area from the brief (per mode). Homes with no stated size are kept.
+const minSqmFor = () => +(briefs[ui.mode] || {}).minSqm || 0;
+function bigEnough(p) { const min = minSqmFor(); if (!min) return true; const s = cmpSqm(p); return s == null || s >= min; }
+// With suggestions off, Nest's untouched suggestions disappear; anything someone reacted
+// to or started tracking stays.
+const hiddenSuggestion = p => !suggestOn && (p.tags || []).includes('suggested') && !(p.feedback || []).length && !p.track_stage && !p.contacted;
+function renderSuggestSwitch() {
+  const bar = document.querySelector('.add-bar'), cb = document.getElementById('suggestOn'), hint = document.getElementById('discoverHint');
+  if (!cb) return;
+  cb.checked = suggestOn; bar?.classList.toggle('sg-off', !suggestOn);
+  if (hint) hint.textContent = suggestOn ? 'Searches Rightmove and adds the top matches, ranked by what you two have liked so far.' : 'Suggestions are off: Nest won’t add homes (not even the daily search), and suggestions nobody has reacted to are hidden.';
+}
+async function setSuggestOn(on) {
+  suggestOn = on; renderSuggestSwitch(); renderList(); refreshMarkers();
+  try { await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ suggestionsOn: on }) }); } catch { }
+}
 // With the hide toggle on, a home counts only if it's inside a walking circle.
 function inLineReach(p) {
   if (!ui.lineHide || !lineTarget.lines.length || !railData) return true;
@@ -411,7 +428,7 @@ function renderRailToggle() {
 function refreshMarkers() {
   Object.values(markers).forEach(m => map.removeLayer(m));
   markers = {};
-  const visible = properties.filter(p => statusOf(p) !== 'Pass' && inMoveWindow(p) && inLineReach(p)); // hide passed + out-of-window + out-of-reach
+  const visible = properties.filter(p => statusOf(p) !== 'Pass' && inMoveWindow(p) && inLineReach(p) && bigEnough(p) && !hiddenSuggestion(p)); // hide passed, out-of-window, out-of-reach, too small, switched-off suggestions
   // Some homes only geocode to their postcode-district centre, so several can land on
   // the exact same point. Fan those out in a small ring so none hides behind another.
   const groups = {};
@@ -438,7 +455,7 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; tasteMemory = s.tasteMemory || {}; archives = s.archives || []; if (s.lineTarget) lineTarget = s.lineTarget; if (s.moveWindow && (s.moveWindow.from !== ui.moveFrom || s.moveWindow.to !== ui.moveTo)) { ui.moveFrom = s.moveWindow.from || ''; ui.moveTo = s.moveWindow.to || ''; saveUi(); if (map) { renderMoveFilter(); renderList(); refreshMarkers(); } } if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; tasteMemory = s.tasteMemory || {}; archives = s.archives || []; if (s.lineTarget) lineTarget = s.lineTarget; if (s.suggestionsOn != null) suggestOn = s.suggestionsOn; if (s.moveWindow && (s.moveWindow.from !== ui.moveFrom || s.moveWindow.to !== ui.moveTo)) { ui.moveFrom = s.moveWindow.from || ''; ui.moveTo = s.moveWindow.to || ''; saveUi(); if (map) { renderMoveFilter(); renderList(); refreshMarkers(); } } if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
   renderModeChrome();
   renderGuardrails();
   updateAreaToggle();
@@ -451,6 +468,7 @@ async function loadSettings() {
   renderReset();
   renderLearning();
   renderLineTarget();
+  renderSuggestSwitch();
 }
 // Collapsible bottom blocks (commute, sharing, sign-in, weekly email) — collapsed by
 // default, remembered per block, with a Show/Hide toggle in the header (like Compare).
@@ -651,6 +669,7 @@ function included(p, filter) {
   if (filter === 'passed') return s === 'Pass';        // passed stays findable regardless of dates
   if (!inMoveWindow(p)) return false;                  // move-in window narrows the active tabs
   if (!inLineReach(p)) return false;                   // so does "hide homes outside the circles"
+  if (!bigEnough(p) || hiddenSuggestion(p)) return false;   // min size, and suggestions switched off
   if (filter === 'queue') return s === 'queue';
   if (filter === 'kept') return s === 'Love' || s === 'View' || s === 'Watch';
   return false;
@@ -924,13 +943,17 @@ const briefPriceLabel = (mode, v) => mode === 'rent' ? `${money(v)} pcm` : (v >=
 function briefHomeText(mode) {
   const b = briefs[mode] || {};
   const tail = mode === 'rent' ? 'Sensible layout; minimal empty weeks before move-in.' : 'Efficient layout, charm and potential.';
-  return `Up to ${briefPriceLabel(mode, b.maxPrice)}, ${bedsLabel(b.beds)}. ${tail}`;
+  return `Up to ${briefPriceLabel(mode, b.maxPrice)}, ${bedsLabel(b.beds)}${b.minSqm ? `, at least ${b.minSqm} sq m` : ''}. ${tail}`;
 }
 // Swap the mode-specific copy (brief ceiling from the editable brief, add-box placeholder,
 // suggest-button label). Auto-suggest now works for both Buy and Rent.
 function renderModeChrome() {
   const home = document.getElementById('briefHomeStatic');
-  if (home) home.textContent = briefHomeText(ui.mode);
+  if (home) {
+    home.textContent = briefHomeText(ui.mode);
+    const small = minSqmFor() ? properties.filter(p => statusOf(p) !== 'Pass' && !bigEnough(p)).length : 0;
+    if (small) home.insertAdjacentHTML('beforeend', ` <span class="size-note">Hiding ${small} smaller home${small === 1 ? '' : 's'}.</span>`);
+  }
   const add = document.getElementById('addUrl');
   if (add) add.placeholder = ui.mode === 'rent'
     ? 'Paste a Rightmove/OnTheMarket “to rent” link to add a rental…'
@@ -947,6 +970,7 @@ function openBriefEditor() {
   const b = briefs[ui.mode] || {};
   document.getElementById('briefMinPrice').value = b.minPrice || '';
   document.getElementById('briefMaxPrice').value = b.maxPrice || '';
+  document.getElementById('briefMinSqm').value = b.minSqm || '';
   document.querySelectorAll('.briefPriceUnit').forEach(e => e.textContent = ui.mode === 'rent' ? 'rent (pcm)' : 'price');
   document.querySelectorAll('#briefBeds input').forEach(c => c.checked = (b.beds || []).includes(+c.value));
   document.getElementById('briefGuardrailsInput').value = guardrails || '';
@@ -963,15 +987,16 @@ async function saveBrief() {
   const minPrice = Math.max(0, Math.round(+document.getElementById('briefMinPrice').value || 0));
   const maxPrice = Math.max(0, Math.round(+document.getElementById('briefMaxPrice').value || 0));
   const beds = [...document.querySelectorAll('#briefBeds input:checked')].map(c => +c.value);
+  const minSqm = Math.max(0, Math.round(+document.getElementById('briefMinSqm').value || 0));
   const guard = (document.getElementById('briefGuardrailsInput').value || '').trim();
   if (!maxPrice) { if (status) status.textContent = 'Enter a max ' + (ui.mode === 'rent' ? 'monthly rent.' : 'price.'); return; }
-  briefs[ui.mode] = { ...briefs[ui.mode], minPrice, maxPrice, beds };
+  briefs[ui.mode] = { ...briefs[ui.mode], minPrice, maxPrice, beds, minSqm };
   if (status) status.textContent = 'Saving…';
   try {
     const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ briefs, guardrails: guard }) })).json();
     if (s.briefs) briefs = s.briefs;
     if (s.guardrails != null) guardrails = s.guardrails;
-    renderModeChrome(); renderGuardrails();
+    renderModeChrome(); renderGuardrails(); renderList(); refreshMarkers();
     if (status) status.textContent = `Saved — “Suggest ${ui.mode === 'rent' ? 'rentals' : 'homes'}” will use this.`;
     setTimeout(closeBriefEditor, 1100);
   } catch { if (status) status.textContent = 'Could not save — is the server running?'; }
@@ -1116,7 +1141,7 @@ async function submitDiscover(btn) {
     const data = await res.json();
     if (data.error) { status.classList.add('err'); status.textContent = data.error; }
     else if (!data.added || !data.added.length) {
-      status.textContent = (data.lineTarget && !data.considered) ? `Nothing new within ${data.lineTarget.minutes} min walk of the line this time (${data.lineTarget.outOfReach} listings were further away). Try a longer walk on the slider, or run it again — each run samples different districts along the line.` : data.outOfWindow ? `Looked at ${data.considered || 0} ${noun} — the best ${data.outOfWindow} weren't free inside your move-in window, so nothing was added. Try again soon, or widen the window.` : `Looked at ${data.considered || 0} ${noun} across your areas — nothing new beat what you already have. Try again in a day or two as fresh listings come on, or widen your brief.`;
+      status.textContent = data.tooSmall && !data.outOfWindow ? `Looked at ${data.considered || 0} ${noun} — the best ${data.tooSmall} were under your ${minSqmFor()} sq m minimum, so nothing was added. Try again soon, or lower the minimum size in the brief.` : (data.lineTarget && !data.considered) ? `Nothing new within ${data.lineTarget.minutes} min walk of the line this time (${data.lineTarget.outOfReach} listings were further away). Try a longer walk on the slider, or run it again — each run samples different districts along the line.` : data.outOfWindow ? `Looked at ${data.considered || 0} ${noun} — the best ${data.outOfWindow} weren't free inside your move-in window, so nothing was added. Try again soon, or widen the window.` : `Looked at ${data.considered || 0} ${noun} across your areas — nothing new beat what you already have. Try again in a day or two as fresh listings come on, or widen your brief.`;
     } else {
       status.textContent = `Added ${data.added.length} ${ui.mode === 'rent' ? 'rental' : 'home'} suggestion${data.added.length > 1 ? 's' : ''}: ${data.added.map(a => '“' + a.name + '”').join(', ')} — look for the ✨ Suggested tag, and each explains why.`;
       ui.filter = 'queue'; saveUi();
@@ -1312,6 +1337,7 @@ function bind() {
   document.getElementById('zoomExtent')?.addEventListener('click', fitToProperties);
   document.getElementById('railToggle')?.addEventListener('click', toggleRail);
   initLineTarget();
+  document.getElementById('suggestOn')?.addEventListener('change', e => setSuggestOn(e.target.checked));
   document.querySelectorAll('#pageNav button').forEach(b => b.onclick = () => switchPage(b.dataset.page));
   initCollapsibles();
   document.getElementById('destAdd')?.addEventListener('click', addDest);

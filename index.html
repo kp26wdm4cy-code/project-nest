@@ -80,7 +80,8 @@
       <div class="add-or">
         <span class="or-word">or</span>
         <button type="button" id="discoverBtn" class="lead-btn ghost">✨ Suggest homes that fit us</button>
-        <small>Searches Rightmove and adds the top matches, ranked by what you two have liked so far.</small>
+        <small id="discoverHint">Searches Rightmove and adds the top matches, ranked by what you two have liked so far.</small>
+        <label class="sg-switch" title="Turn Nest's suggestions on or off for everyone in this space"><input type="checkbox" id="suggestOn" checked /> Suggestions</label>
       </div>
       <div class="line-target" id="lineTarget" aria-label="Only suggest homes near a tube line">
         <span class="lt-label">🚇 Near a line</span>
@@ -132,6 +133,9 @@
           </label>
           <label class="be-price">Max <span class="briefPriceUnit">price</span>
             <input id="briefMaxPrice" type="number" min="0" step="1000" inputmode="numeric" />
+          </label>
+          <label class="be-price">Min size <span>(sq m)</span>
+            <input id="briefMinSqm" type="number" min="0" max="500" step="1" inputmode="numeric" placeholder="any" />
           </label>
           <div class="be-beds"><span class="be-legend">Bedrooms</span>
             <div id="briefBeds">

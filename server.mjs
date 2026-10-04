@@ -251,6 +251,7 @@ async function addListing(listingUrl, opts = {}) {
   if (lat == null) return { error: 'Could not work out the location from that page. A Rightmove link works best.' };
   if (!ex.price) return { error: 'Could not read the price from that page.' };
   if (opts.window && !inWindow(ex.availableFrom, opts.window)) return { ok: false, skipped: 'window', availableFrom: ex.availableFrom };
+  if (opts.minSqm && sqmOf(ex.size) != null && sqmOf(ex.size) < opts.minSqm) return { ok: false, skipped: 'size', size: ex.size };
   const wsId = opts.wsId || DEFAULT_WS;
   const rmId = (u.href.match(/(\d{5,})/) || [])[1];
   const prefix = /rightmove/i.test(u.hostname) ? 'rm-' : /zoopla/i.test(u.hostname) ? 'zp-' : /onthemarket/i.test(u.hostname) ? 'otm-' : 'pl-';
@@ -434,6 +435,8 @@ function inWindow(date, w) {
 // so the straight-line catchment radius is minutes * 80 / 1.25 m (the map draws the same).
 const WALK_M_PER_MIN = 80, STREET_FACTOR = 1.25;
 const catchmentMetres = minutes => minutes * WALK_M_PER_MIN / STREET_FACTOR;
+const suggestionsOn = async wsId => !(await wsGet(wsId, 'suggestions_off', false));
+const sqmOf = size => { const m = String(size || '').match(/([\d.]+)\s*(?:sq\s*m|sqm|m²|m2)/i); return m ? +m[1] : null; };
 async function getLineTarget(wsId) {
   const t = await wsGet(wsId, 'line_target', null) || {};
   const lines = (Array.isArray(t.lines) ? t.lines : []).filter(l => RAIL_LINES[l]);
@@ -551,17 +554,18 @@ async function discover(opts = {}) {
   // With a move-in window set, a listing's date is only known once its page is read, so
   // try further down the ranking (bounded) to make up for ones that fall outside it.
   const win = await getMoveWindow(wsId);
-  const windowOn = !!(win.from || win.to);
-  const added = []; let outOfWindow = 0;
-  for (const t of scored.slice(0, windowOn ? max * 3 : max)) {
+  const windowOn = !!(win.from || win.to), minSqm = brief.minSqm || 0;
+  const added = []; let outOfWindow = 0, tooSmall = 0;
+  for (const t of scored.slice(0, (windowOn || minSqm) ? max * 3 : max)) {
     if (added.length >= max) break;
-    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief'), score: t.score, wsId, window: windowOn ? win : null }).catch(() => null);
+    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief'), score: t.score, wsId, window: windowOn ? win : null, minSqm }).catch(() => null);
     if (r && r.skipped === 'window') outOfWindow++;
+    if (r && r.skipped === 'size') tooSmall++;
     if (r && r.ok && !r.existing) added.push({ name: r.name, why: t.why });
     await sleep(600);
   }
   if (opts.poolCap) await capSuggestions(opts.poolCap, mode, wsId);
-  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode, outOfWindow, window: windowOn ? win : null,
+  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode, outOfWindow, tooSmall, window: windowOn ? win : null,
     lineTarget: targetStations ? { ...target, stations: targetStations.length, outOfReach } : null };
 }
 
@@ -1294,12 +1298,14 @@ createServer(async (req, res) => {
     const scheduled = url.searchParams.get('scheduled') === '1';
     const mode = url.searchParams.get('mode') === 'rent' ? 'rent' : 'buy';
     if (scheduled) {   // cron: discover for every workspace using each one's own brief/areas
-      try { const wss = (await db.execute('SELECT id FROM workspaces')).rows; for (const w of wss) await discover({ max: 8, poolCap: 20, maxAreas: 14, mode, wsId: w.id }); return send(res, 200, JSON.stringify({ scheduled: true, workspaces: wss.length, mode })); }
+      try { const wss = (await db.execute('SELECT id FROM workspaces')).rows; for (const w of wss) { if (await suggestionsOn(w.id)) await discover({ max: 8, poolCap: 20, maxAreas: 14, mode, wsId: w.id }); } return send(res, 200, JSON.stringify({ scheduled: true, workspaces: wss.length, mode })); }
       catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Scheduled discovery did not complete.' })); }
     }
     const u = await currentUser(req);   // manual: needs a session, scoped to the caller's space
     if (!u) return send(res, 401, JSON.stringify({ error: 'Sign in required.' }));
-    try { return send(res, 200, JSON.stringify(await discover({ mode, wsId: await userWorkspace(u) }))); }
+    const uws = await userWorkspace(u);
+    if (!(await suggestionsOn(uws))) return send(res, 200, JSON.stringify({ added: [], error: 'Suggestions are turned off for this space.' }));
+    try { return send(res, 200, JSON.stringify(await discover({ mode, wsId: uws }))); }
     catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Search did not complete (Rightmove may be rate-limiting). Try again shortly.' })); }
   }
   if (url.pathname === '/api/send-weekly' && req.method === 'POST') {
@@ -1318,6 +1324,7 @@ createServer(async (req, res) => {
       guardrails: await wsGet(req.wsId, 'guardrails', DEFAULT_GUARDRAILS),
       moveWindow: await getMoveWindow(req.wsId),
       lineTarget: await getLineTarget(req.wsId),
+      suggestionsOn: await suggestionsOn(req.wsId),
       tasteMemory: memorySummary(await wsGet(req.wsId, 'taste_memory', {})),
       archives: await listArchives(req.wsId),
       space: { id: req.wsId, name: await workspaceName(req.wsId), people: await workspacePeople(req.wsId) }, you: normEmail(req.user.email),
@@ -1348,6 +1355,7 @@ createServer(async (req, res) => {
           const out = { ...cur[m] };
           if (Number.isFinite(+src.maxPrice)) out.maxPrice = Math.min(m === 'rent' ? 100000 : 100000000, Math.max(0, Math.round(+src.maxPrice)));
           if (Number.isFinite(+src.minPrice)) out.minPrice = Math.max(0, Math.round(+src.minPrice));
+          if (src.minSqm !== undefined) out.minSqm = Number.isFinite(+src.minSqm) ? Math.min(500, Math.max(0, Math.round(+src.minSqm))) : 0;
           if (Array.isArray(src.beds)) out.beds = [...new Set(src.beds.map(Number).filter(n => n >= 0 && n <= 6))].sort((a, b) => a - b);
           cur[m] = out;
         }
@@ -1362,6 +1370,7 @@ createServer(async (req, res) => {
         await setSetting('allowed_users', [...byEmail.values()].slice(0, 50));
       }
       if (typeof b.guardrails === 'string') await wsSet(ws, 'guardrails', b.guardrails.trim().slice(0, 400));
+      if (typeof b.suggestionsOn === 'boolean') await wsSet(ws, 'suggestions_off', !b.suggestionsOn);
       if (b.lineTarget && typeof b.lineTarget === 'object') {
         const lines = (Array.isArray(b.lineTarget.lines) ? b.lineTarget.lines : []).filter(l => RAIL_LINES[l]).slice(0, 6);
         await wsSet(ws, 'line_target', { lines, minutes: Math.min(30, Math.max(1, Math.round(+b.lineTarget.minutes || 5))) });
