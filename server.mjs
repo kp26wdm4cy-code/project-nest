@@ -581,9 +581,12 @@ async function discover(opts = {}) {
     const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief'), score: t.score, wsId, window: windowOn ? win : null, minSqm }).catch(() => null);
     if (r && r.skipped === 'window') outOfWindow++;
     if (r && r.skipped === 'size') tooSmall++;
-    if (r && r.ok && !r.existing) added.push({ name: r.name, why: t.why });
+    if (r && r.ok && !r.existing) added.push({ id: r.id, name: r.name, why: t.why });
     await sleep(600);
   }
+  // Give the new homes the full re-check straight away (a second read catches size,
+  // tenure, dates or last-sold details the first fetch sometimes misses).
+  if (added.length) { await sleep(1500); await refresh(added.map(a => a.id)).catch(() => { }); }
   if (opts.poolCap) await capSuggestions(opts.poolCap, mode, wsId);
   return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode, outOfWindow, tooSmall, window: windowOn ? win : null,
     lineTarget: targetStations ? { ...target, stations: targetStations.length, outOfReach } : null };
@@ -1138,8 +1141,12 @@ async function exportCsv(wsId) {
   return [headings.join(','), ...lines].join('\r\n');
 }
 
-async function refresh() {
-  const items = (await db.execute({ sql: 'SELECT id, listing_url, price, size, listing_type FROM properties WHERE availability != ?', args: ['off-market'] })).rows;
+// Re-check saved homes. With `ids`, only those homes (used straight after suggestions are
+// added, so new homes get the full check at once); without, every live home + area data.
+async function refresh(ids) {
+  const items = ids
+    ? (ids.length ? (await db.execute({ sql: `SELECT id, listing_url, price, size, listing_type FROM properties WHERE id IN (${ids.map(() => '?').join(',')})`, args: ids })).rows : [])
+    : (await db.execute({ sql: 'SELECT id, listing_url, price, size, listing_type FROM properties WHERE availability != ?', args: ['off-market'] })).rows;
   const now = new Date().toISOString();
   const results = [];
   for (const item of items) {
@@ -1198,7 +1205,7 @@ async function refresh() {
       results.push({ id: item.id, status: 'needs-check' });
     }
   }
-  refreshInsights().catch(() => {}); // recompute area data in the background so the button returns quickly
+  if (!ids) refreshInsights().catch(() => {}); // recompute area data in the background (new homes already compute theirs on add)
   return { availability: results };
 }
 
@@ -1506,4 +1513,4 @@ createServer(async (req, res) => {
   } catch (e) { console.log('Commute bootstrap skipped:', e && e.message); }
 })();
 
-setInterval(() => refresh().catch(() => {}), checkEveryMs).unref();
+setInterval(() => maybeRefresh().catch(() => {}), checkEveryMs).unref();   // same 12 h guard as the other triggers
