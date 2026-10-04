@@ -305,7 +305,44 @@ async function getBriefs(wsId) {
   if (saved && typeof saved === 'object') for (const m of ['buy', 'rent']) if (saved[m] && typeof saved[m] === 'object') out[m] = { ...out[m], ...saved[m] };
   return out;
 }
+// Taste Nest acts on = what the live verdicts say + the taste remembered from homes
+// cleared by "Start fresh" (ws_settings 'taste_memory', one profile per mode).
 async function buildTaste(mode = 'buy', wsId) {
+  const live = await liveTaste(mode, wsId);
+  const mem = ((await wsGet(wsId, 'taste_memory', {})) || {})[mode];
+  if (!mem) return live;
+  for (const [o, w] of Object.entries(mem.areas || {})) live.areaScore.set(o, (live.areaScore.get(o) || 0) + w);
+  for (const [k, w] of Object.entries(mem.kw || {})) live.kw.set(k, (live.kw.get(k) || 0) + w);
+  const pSum = live.priceSum + (mem.priceSum || 0), pN = live.priceN + (mem.priceN || 0);
+  live.priceCenter = pN ? pSum / pN : null;
+  live.count += mem.count || 0;
+  return live;
+}
+// Fold today's verdicts into the remembered taste before listings are wiped. Older memory
+// fades (x0.75 per clear) so recent decisions count most; weak keyword noise is pruned.
+async function distilTaste(wsId) {
+  const old = (await wsGet(wsId, 'taste_memory', {})) || {};
+  const out = {};
+  for (const mode of ['buy', 'rent']) {
+    const live = await liveTaste(mode, wsId), prev = old[mode] || {}, F = 0.75;
+    const areas = {}, kw = {};
+    for (const [o, w] of Object.entries(prev.areas || {})) areas[o] = w * F;
+    for (const [o, w] of live.areaScore) areas[o] = (areas[o] || 0) + w;
+    for (const [k, w] of Object.entries(prev.kw || {})) kw[k] = w * F;
+    for (const [k, w] of live.kw) kw[k] = (kw[k] || 0) + w;
+    const round = o => Object.fromEntries(Object.entries(o).filter(([, w]) => Math.abs(w) >= 0.5).map(([k, w]) => [k, Math.round(w * 100) / 100]));
+    const kwTop = Object.fromEntries(Object.entries(round(kw)).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 80));
+    const count = Math.round((prev.count || 0) * F) + live.count;
+    if (!count) { if (prev.count) out[mode] = prev; continue; }
+    out[mode] = { areas: round(areas), kw: kwTop, priceSum: (prev.priceSum || 0) * F + live.priceSum, priceN: (prev.priceN || 0) * F + live.priceN, count, updatedAt: new Date().toISOString() };
+  }
+  return out;
+}
+const memorySummary = mem => Object.fromEntries(['buy', 'rent'].filter(m => mem && mem[m]).map(m => [m, {
+  count: mem[m].count, areas: Object.entries(mem[m].areas || {}).filter(([, w]) => w > 0).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([o]) => o),
+  priceCenter: mem[m].priceN ? Math.round(mem[m].priceSum / mem[m].priceN) : null,
+}]));
+async function liveTaste(mode = 'buy', wsId) {
   const props = (await db.execute({ sql: "SELECT id, price, area, tags, agent_view FROM properties WHERE COALESCE(listing_type,'buy')=? AND workspace_id=?", args: [mode, wsId] })).rows;
   const fb = (await db.execute('SELECT property_id, verdict, note FROM feedback')).rows;
   const byId = new Map(props.map(p => [p.id, p]));
@@ -324,7 +361,7 @@ async function buildTaste(mode = 'buy', wsId) {
   const kw = new Map();
   const tally = (arr, sign) => arr.forEach(x => new Set(x.doc.split(/[^a-z]+/).filter(w => w.length > 3 && !STOP.has(w))).forEach(w => kw.set(w, (kw.get(w) || 0) + sign)));
   tally(pos, 1); tally(neg, -1);
-  return { areaScore, priceCenter, kw, count: pos.length + neg.length };
+  return { areaScore, priceCenter, kw, count: pos.length + neg.length, priceSum: prices.reduce((a, b) => a + b, 0), priceN: prices.length };
 }
 function scoreCandidate(ex, taste, brief) {
   let score = 0; const why = [];
@@ -500,7 +537,8 @@ async function initialise() {
   CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS memberships (workspace_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL, PRIMARY KEY(workspace_id,user_id));
   CREATE TABLE IF NOT EXISTS invites (workspace_id TEXT NOT NULL, email TEXT NOT NULL, name TEXT, role TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL, PRIMARY KEY(workspace_id,email));
-  CREATE TABLE IF NOT EXISTS ws_settings (workspace_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(workspace_id,key));`);
+  CREATE TABLE IF NOT EXISTS ws_settings (workspace_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(workspace_id,key));
+  CREATE TABLE IF NOT EXISTS archives (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, created_at TEXT NOT NULL, summary TEXT NOT NULL, data TEXT NOT NULL);`);
   // Columns added over time — guarded so re-running is harmless.
   for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER',
     'listed_date TEXT', 'listed_reason TEXT', 'last_sold_price INTEGER', 'last_sold_date TEXT', 'last_sold_exact INTEGER',
@@ -905,6 +943,64 @@ const RAIL_LINES = {
   dlr: '#00A4A7', liberty: '#676767', lioness: '#F1B41C', mildmay: '#437EC1',
   suffragette: '#39B97A', weaver: '#972861', windrush: '#EF4D5E',
 };
+// --- "Start fresh": snapshot every listing in a space, remember the taste, then wipe ---
+const CHILD_TABLES = ['feedback', 'insights', 'media', 'commutes', 'guest_notes'];
+const asObjects = rs => rs.rows.map(r => Object.fromEntries(rs.columns.map((c, i) => [c, r[i]])));
+const MAX_ARCHIVES = 5;
+async function masterClear(wsId, user) {
+  const props = asObjects(await db.execute({ sql: 'SELECT * FROM properties WHERE workspace_id=?', args: [wsId] }));
+  const ids = props.map(p => p.id);
+  const children = {};
+  for (const t of CHILD_TABLES) {
+    children[t] = [];
+    for (let i = 0; i < ids.length; i += 200) {   // chunk the IN() list
+      const chunk = ids.slice(i, i + 200);
+      if (chunk.length) children[t].push(...asObjects(await db.execute({ sql: `SELECT * FROM ${t} WHERE property_id IN (${chunk.map(() => '?').join(',')})`, args: chunk })));
+    }
+  }
+  const priorMemory = (await wsGet(wsId, 'taste_memory', {})) || {};
+  const memory = await distilTaste(wsId);           // read verdicts BEFORE they are deleted
+  const fb = children.feedback;
+  const summary = {
+    homes: props.length, buy: props.filter(p => (p.listing_type || 'buy') === 'buy').length, rent: props.filter(p => p.listing_type === 'rent').length,
+    verdicts: fb.filter(f => f.verdict).length, keepers: new Set(fb.filter(f => ['Love', 'View', 'Watch'].includes(f.verdict)).map(f => f.property_id)).size,
+    notes: fb.filter(f => f.note).length + children.guest_notes.length, by: user?.name || '',
+  };
+  const id = 'ar-' + randomBytes(6).toString('hex'), at = new Date().toISOString();
+  await db.execute({ sql: 'INSERT INTO archives(id,workspace_id,created_at,summary,data) VALUES(?,?,?,?,?)',
+    args: [id, wsId, at, JSON.stringify(summary), JSON.stringify({ version: 1, workspace: wsId, createdAt: at, summary, properties: props, children, priorMemory, memory })] });
+  // Only once the snapshot is safely written: save the taste, then wipe in one batch.
+  await wsSet(wsId, 'taste_memory', memory);
+  const stmts = [];
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200), q = chunk.map(() => '?').join(',');
+    for (const t of CHILD_TABLES) stmts.push({ sql: `DELETE FROM ${t} WHERE property_id IN (${q})`, args: chunk });
+  }
+  stmts.push({ sql: 'DELETE FROM properties WHERE workspace_id=?', args: [wsId] });
+  await db.batch(stmts, 'write');
+  const old = (await db.execute({ sql: 'SELECT id FROM archives WHERE workspace_id=? ORDER BY created_at DESC', args: [wsId] })).rows.slice(MAX_ARCHIVES);
+  for (const r of old) await db.execute({ sql: 'DELETE FROM archives WHERE id=?', args: [r.id] });
+  return { ok: true, archiveId: id, cleared: props.length, summary, remembered: memorySummary(memory) };
+}
+async function listArchives(wsId) {
+  return (await db.execute({ sql: 'SELECT id, created_at, summary FROM archives WHERE workspace_id=? ORDER BY created_at DESC', args: [wsId] })).rows
+    .map(r => ({ id: r.id, createdAt: r.created_at, ...JSON.parse(r.summary) }));
+}
+// Put a snapshot's homes back (skipping any that were re-added since) and roll the
+// remembered taste back to before that clear, so restored verdicts aren't counted twice.
+async function restoreArchive(wsId, id) {
+  const r = (await db.execute({ sql: 'SELECT data FROM archives WHERE id=? AND workspace_id=?', args: [id, wsId] })).rows[0];
+  if (!r) return null;
+  const a = JSON.parse(r.data);
+  const present = new Set((await db.execute({ sql: 'SELECT id FROM properties', args: [] })).rows.map(x => x.id));
+  const insert = (t, row) => { const cols = Object.keys(row); return { sql: `INSERT OR IGNORE INTO ${t} (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`, args: cols.map(c => row[c]) }; };
+  const back = a.properties.filter(p => !present.has(p.id)), backIds = new Set(back.map(p => p.id));
+  const stmts = back.map(p => insert('properties', { ...p, workspace_id: wsId }));
+  for (const t of CHILD_TABLES) for (const row of (a.children[t] || [])) if (backIds.has(row.property_id)) stmts.push(insert(t, row));
+  if (stmts.length) await db.batch(stmts, 'write');
+  await wsSet(wsId, 'taste_memory', a.priorMemory || {});
+  return { ok: true, restored: back.length, skipped: a.properties.length - back.length };
+}
 let railCache = null, railFetching = null;
 async function railLines() {
   if (railCache && Date.now() - railCache.at < 24 * 3600e3) return railCache.data;
@@ -1104,6 +1200,24 @@ createServer(async (req, res) => {
     req.wsId = await userWorkspace(u);
   }
 
+  if (url.pathname === '/api/master-clear' && req.method === 'POST') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    let b = {}; try { b = JSON.parse(body || '{}'); } catch { }
+    if (b.confirm !== 'CLEAR') return send(res, 400, JSON.stringify({ error: 'Type CLEAR to confirm.' }));
+    try { return send(res, 200, JSON.stringify(await masterClear(req.wsId, req.user))); }
+    catch (e) { return send(res, 500, JSON.stringify({ error: 'Could not clear — nothing was deleted. ' + String(e && e.message || e) })); }
+  }
+  const arc = url.pathname.match(/^\/api\/archives\/([\w-]+)\/(download|restore)$/);
+  if (arc && arc[2] === 'download' && req.method === 'GET') {
+    const r = (await db.execute({ sql: 'SELECT created_at, data FROM archives WHERE id=? AND workspace_id=?', args: [arc[1], req.wsId] })).rows[0];
+    if (!r) return send(res, 404, JSON.stringify({ error: 'No such snapshot.' }));
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="nest-snapshot-${String(r.created_at).slice(0, 10)}.json"`, 'Cache-Control': 'no-store' });
+    return res.end(r.data);
+  }
+  if (arc && arc[2] === 'restore' && req.method === 'POST') {
+    try { const out = await restoreArchive(req.wsId, arc[1]); return send(res, out ? 200 : 404, JSON.stringify(out || { error: 'No such snapshot.' })); }
+    catch (e) { return send(res, 500, JSON.stringify({ error: 'Restore failed. ' + String(e && e.message || e) })); }
+  }
   if (url.pathname === '/api/rail-lines' && req.method === 'GET') return send(res, 200, JSON.stringify(await railLines()));
   if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(req.user.name, req.wsId)));
   if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(req.wsId), 'text/csv; charset=utf-8');
@@ -1135,6 +1249,8 @@ createServer(async (req, res) => {
       emails: await wsGet(req.wsId, 'emails', []), briefs: await getBriefs(req.wsId),
       guardrails: await wsGet(req.wsId, 'guardrails', DEFAULT_GUARDRAILS),
       moveWindow: await getMoveWindow(req.wsId),
+      tasteMemory: memorySummary(await wsGet(req.wsId, 'taste_memory', {})),
+      archives: await listArchives(req.wsId),
       space: { id: req.wsId, name: await workspaceName(req.wsId), people: await workspacePeople(req.wsId) }, you: normEmail(req.user.email),
       isHost: host,
       ...(host ? { allowedUsers: await getAllowed() } : {}),   // the global sign-in list is host-only

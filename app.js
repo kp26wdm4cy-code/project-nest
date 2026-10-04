@@ -27,6 +27,9 @@ let destinations = [], subscribedEmails = [];
 let briefs = { buy: { maxPrice: 550000, minPrice: 120000, beds: [1, 2] }, rent: { maxPrice: 2500, minPrice: 800, beds: [1, 2] } };
 let allowedUsers = [];   // emails permitted to sign in ({email,name}) — host only
 let isHost = false;      // whether the signed-in user administers the global sign-in list
+let tasteMemory = {};    // taste Nest remembers from cleared listings ({buy,rent}: {count, areas, priceCenter})
+let archives = [];       // saved snapshots from "Start fresh"
+let resetStep = 0;       // 0 = idle, 1 = first warning, 2 = type CLEAR
 let guardrails = 'Outdoor space preferred. No noisy roads or poor light. No ground floor unless secure/gated. Ex-local authority is considered.';
 
 const money = value => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(value);
@@ -356,7 +359,7 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; if (s.moveWindow && (s.moveWindow.from !== ui.moveFrom || s.moveWindow.to !== ui.moveTo)) { ui.moveFrom = s.moveWindow.from || ''; ui.moveTo = s.moveWindow.to || ''; saveUi(); if (map) { renderMoveFilter(); renderList(); refreshMarkers(); } } if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; tasteMemory = s.tasteMemory || {}; archives = s.archives || []; if (s.moveWindow && (s.moveWindow.from !== ui.moveFrom || s.moveWindow.to !== ui.moveTo)) { ui.moveFrom = s.moveWindow.from || ''; ui.moveTo = s.moveWindow.to || ''; saveUi(); if (map) { renderMoveFilter(); renderList(); refreshMarkers(); } } if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
   renderModeChrome();
   renderGuardrails();
   updateAreaToggle();
@@ -366,6 +369,8 @@ async function loadSettings() {
   renderAllowChips();
   renderSpaceBox();
   renderUserChip();
+  renderReset();
+  renderLearning();
 }
 // Collapsible bottom blocks (commute, sharing, sign-in, weekly email) — collapsed by
 // default, remembered per block, with a Show/Hide toggle in the header (like Compare).
@@ -766,7 +771,63 @@ function renderLearning() {
     html = `<h3>${loves ? `${loves} lead${loves > 1 ? 's' : ''} you want to keep in play.` : 'Your first decisions are taking shape.'}</h3>
       <p>${notes.length ? `You have left ${notes.length} note${notes.length > 1 ? 's' : ''} for the next scout.` : 'The next useful signal is why — light, layout, street, building or location.'}${passes ? ` ${passes} pass${passes > 1 ? 'es' : ''} help me avoid similar homes.` : ''}</p>`;
   }
+  const mem = tasteMemory[ui.mode];
+  if (mem && mem.count) html += `<p class="memory-line">Also carrying over what Nest learned from ${mem.count} earlier verdict${mem.count === 1 ? '' : 's'} before a fresh start${mem.areas && mem.areas.length ? ` — leaning ${mem.areas.join(', ')}` : ''}. “Suggest…” still uses it.</p>`;
   document.getElementById('learningText').innerHTML = html;
+}
+
+// ---- Start fresh: two-step master clear, with a restorable snapshot ---------
+function renderReset() {
+  const box = document.getElementById('resetBody'); if (!box) return;
+  const n = allProperties.length;
+  const kept = `<ul><li>A <b>saved snapshot</b> of every home, verdict, note and tracking detail, which you can restore or download below</li>
+    <li>Your <b>learned taste</b> (areas, price level, words you react to), so suggestions don't start from zero</li>
+    <li>Your brief, guardrails, search areas, commute places, move-in window, people and weekly email</li></ul>`;
+  if (resetStep === 0) box.innerHTML = `<p>Wipes the slate clean for everyone in this space. Kept:</p>${kept}
+    <div class="reset-actions"><button type="button" class="btn-danger outline" id="resetStart"${n ? '' : ' disabled'}>Clear all listings…</button>${n ? '' : '<span class="dest-empty">Nothing to clear.</span>'}</div><p class="add-status" id="resetStatus"></p>`;
+  else if (resetStep === 1) box.innerHTML = `<div class="reset-warn"><p><b>Step 1 of 2.</b> This removes all <b>${n} home${n === 1 ? '' : 's'}</b> (buy and rent) from the lists, map and Curate page, along with every verdict, note, second opinion and tracking detail, for everyone in this space.</p></div>
+    <p>Nest saves a snapshot first and keeps your learned taste, so nothing you've taught it is lost.</p>
+    <div class="reset-actions"><button type="button" class="btn-danger" id="resetNext">Yes, continue</button><button type="button" class="quiet-button" id="resetCancel">Cancel</button></div>`;
+  else box.innerHTML = `<div class="reset-warn"><p><b>Step 2 of 2.</b> Type <b>CLEAR</b> to delete all ${n} home${n === 1 ? '' : 's'}.</p></div>
+    <div class="reset-actions"><input id="resetConfirm" autocomplete="off" placeholder="CLEAR" /><button type="button" class="btn-danger" id="resetGo" disabled>Clear everything</button><button type="button" class="quiet-button" id="resetCancel">Cancel</button></div><p class="add-status" id="resetStatus"></p>`;
+  document.getElementById('resetStart')?.addEventListener('click', () => { resetStep = 1; renderReset(); });
+  document.getElementById('resetNext')?.addEventListener('click', () => { resetStep = 2; renderReset(); document.getElementById('resetConfirm')?.focus(); });
+  document.getElementById('resetCancel')?.addEventListener('click', () => { resetStep = 0; renderReset(); });
+  const inp = document.getElementById('resetConfirm'), go = document.getElementById('resetGo');
+  inp?.addEventListener('input', () => { go.disabled = inp.value.trim().toUpperCase() !== 'CLEAR'; });
+  go?.addEventListener('click', masterClear);
+  renderArchives();
+}
+async function masterClear() {
+  const go = document.getElementById('resetGo'), st = document.getElementById('resetStatus');
+  go.disabled = true; st.classList.remove('err'); st.textContent = 'Saving a snapshot, then clearing…';
+  try {
+    const r = await fetch('/api/master-clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: 'CLEAR' }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'failed');
+    resetStep = 0; selectedId = null;
+    await loadProperties(); await loadSettings(); renderAll();
+    const m = d.remembered || {}, cnt = (m.buy?.count || 0) + (m.rent?.count || 0);
+    const s2 = document.getElementById('resetStatus');
+    if (s2) s2.textContent = `Cleared ${d.cleared} home${d.cleared === 1 ? '' : 's'}. Snapshot saved below. Nest remembers your taste from ${cnt} verdict${cnt === 1 ? '' : 's'}.`;
+  } catch (e) { st.classList.add('err'); st.textContent = 'Could not clear: ' + e.message; go.disabled = false; }
+}
+function renderArchives() {
+  const box = document.getElementById('archiveList'); if (!box) return;
+  if (!archives.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="archive-list"><p><b>Saved snapshots</b> (the last ${archives.length} kept)</p>${archives.map(a => `<div class="archive-row">
+    <span>${fmtDate(a.createdAt.slice(0, 10))} · ${a.homes} home${a.homes === 1 ? '' : 's'} · ${a.verdicts} verdict${a.verdicts === 1 ? '' : 's'}${a.by ? ' · cleared by ' + esc(a.by) : ''}</span>
+    <span class="reset-actions"><a class="quiet-button" href="/api/archives/${a.id}/download" download>Download</a><button type="button" class="quiet-button" data-restore="${a.id}">Restore</button></span></div>`).join('')}</div>`;
+  box.querySelectorAll('[data-restore]').forEach(b => b.onclick = async () => {
+    if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Tap again to restore'; return; }   // second tap confirms
+    b.disabled = true; b.textContent = 'Restoring…';
+    try {
+      const d = await (await fetch(`/api/archives/${b.dataset.restore}/restore`, { method: 'POST' })).json();
+      if (d.error) throw new Error(d.error);
+      await loadProperties(); await loadSettings(); renderAll();
+      const s = document.getElementById('resetStatus'); if (s) s.textContent = `Restored ${d.restored} home${d.restored === 1 ? '' : 's'}${d.skipped ? ` (${d.skipped} already here)` : ''}.`;
+    } catch (e) { b.textContent = 'Restore failed'; }
+  });
 }
 
 // Live brief signals derived from the current contributor's keepers (Love/View/Watch —
@@ -1149,7 +1210,7 @@ function renderCurate() {
 
 function renderAll() {
   renderModeSwitch(); renderModeChrome(); renderMoveFilter();
-  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote(); renderCurate();
+  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote(); renderCurate(); renderReset();
 }
 // Explore vs Curate & track pages.
 function switchPage(page) {
