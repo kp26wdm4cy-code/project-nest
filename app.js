@@ -11,7 +11,8 @@ ui.moveFrom ||= '';    // move-in window filter (ISO dates, '' = open)
 ui.moveTo ||= '';
 ui.page = ['explore', 'curate'].includes(ui.page) ? ui.page : 'explore';  // Explore vs Curate & track
 ui.collapsed ||= {};
-ui.rail = ui.rail !== false;   // coloured tube/rail lines on the map (on by default)        // collapsed state of the bottom settings blocks (default collapsed)
+ui.rail = ui.rail !== false;
+ui.lineHide = !!ui.lineHide;   // hide homes outside the "Near a line" walking circles   // coloured tube/rail lines on the map (on by default)        // collapsed state of the bottom settings blocks (default collapsed)
 const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 
 let allProperties = [];   // every home from the server (both buy and rent)
@@ -346,16 +347,26 @@ async function renderLineTarget() {
   document.getElementById('ltChips').innerHTML = lineTarget.lines.map(id => { const l = lineInfo(id); return `<span class="lt-chip"><i style="background:${l ? l.colour : '#999'}"></i>${esc(l ? l.name : id)}<button type="button" data-line="${id}" aria-label="Remove line">×</button></span>`; }).join('');
   document.getElementById('ltChips').querySelectorAll('[data-line]').forEach(b => b.onclick = () => { lineTarget.lines = lineTarget.lines.filter(x => x !== b.dataset.line); saveLineTarget(); renderLineTarget(); });
   document.getElementById('ltMinutes').value = lineTarget.minutes;
+  document.getElementById('ltHide').checked = ui.lineHide;
   document.getElementById('ltMinLabel').textContent = lineTarget.minutes + ' min';
   drawCatchments();
-  renderLineNote();
+  if (ui.lineHide) refreshReach(); else renderLineNote();
 }
+// With the hide toggle on, a home counts only if it's inside a walking circle.
+function inLineReach(p) {
+  if (!ui.lineHide || !lineTarget.lines.length || !railData) return true;
+  if (p.latitude == null) return true;
+  const r = catchRadius(lineTarget.minutes), pt = { lat: p.latitude, lng: p.longitude };
+  return targetStations().some(s => distM(pt, s) <= r);
+}
+const refreshReach = () => { if (!map) return; renderList(); refreshMarkers(); renderLineNote(); };
 function renderLineNote() {
   const note = document.getElementById('ltNote'); if (!note) return;
   if (!lineTarget.lines.length) { note.textContent = 'Pick a line to only suggest homes within walking distance of its stations. The walking circles show on the map.'; return; }
   const st = targetStations(), r = catchRadius(lineTarget.minutes);
   const near = properties.filter(p => p.latitude != null && st.some(s => distM({ lat: p.latitude, lng: p.longitude }, s) <= r)).length;
-  note.textContent = `“Suggest…” now only adds homes about ${lineTarget.minutes} min walk or less from one of ${st.length} stations, searching the districts along the line. ${near} of the ${properties.length} homes you already have are inside the circles.`;
+  const hidden = ui.lineHide ? properties.filter(p => statusOf(p) !== 'Pass' && !inLineReach(p)).length : 0;
+  note.textContent = (hidden ? `Hiding ${hidden} home${hidden === 1 ? '' : 's'} outside the circles. ` : '') + `“Suggest…” now only adds homes about ${lineTarget.minutes} min walk or less from one of ${st.length} stations, searching the districts along the line. ${near} of the ${properties.length} homes you already have are inside the circles.`;
 }
 function drawCatchments(fit) {
   if (!map) return;
@@ -385,7 +396,8 @@ function initLineTarget() {
     catchLayer?.eachLayer(c => c.setRadius(catchRadius(lineTarget.minutes)));
     renderLineNote();
   });
-  slider?.addEventListener('change', saveLineTarget);
+  slider?.addEventListener('change', () => { saveLineTarget(); if (ui.lineHide) refreshReach(); });
+  document.getElementById('ltHide')?.addEventListener('change', e => { ui.lineHide = e.target.checked; saveUi(); refreshReach(); });
 }
 function toggleRail() {
   ui.rail = !ui.rail; saveUi();
@@ -399,7 +411,7 @@ function renderRailToggle() {
 function refreshMarkers() {
   Object.values(markers).forEach(m => map.removeLayer(m));
   markers = {};
-  const visible = properties.filter(p => statusOf(p) !== 'Pass' && inMoveWindow(p)); // hide passed + out-of-window
+  const visible = properties.filter(p => statusOf(p) !== 'Pass' && inMoveWindow(p) && inLineReach(p)); // hide passed + out-of-window + out-of-reach
   // Some homes only geocode to their postcode-district centre, so several can land on
   // the exact same point. Fan those out in a small ring so none hides behind another.
   const groups = {};
@@ -638,6 +650,7 @@ function included(p, filter) {
   const s = statusOf(p);
   if (filter === 'passed') return s === 'Pass';        // passed stays findable regardless of dates
   if (!inMoveWindow(p)) return false;                  // move-in window narrows the active tabs
+  if (!inLineReach(p)) return false;                   // so does "hide homes outside the circles"
   if (filter === 'queue') return s === 'queue';
   if (filter === 'kept') return s === 'Love' || s === 'View' || s === 'Watch';
   return false;
@@ -743,16 +756,6 @@ function renderDetail() {
     <textarea id="note" placeholder="What works or puts you off? e.g. 'living room feels dark'">${mine.note || ''}</textarea>
     <div class="note-actions"><button type="button" id="noteSave" class="lead-btn">Save note</button></div>
     <div class="saved-note" id="savedNote">${mine.verdict || mine.note ? 'Saved on the shared server.' : ''}</div>
-    <div class="guest-notes">
-      <p class="kicker">SECOND OPINIONS</p>
-      <div class="guest-list">${(p.guestNotes || []).map(g => `<div class="guest-item"><div class="guest-head"><strong>${esc(g.name)}</strong><span class="guest-when">${whenChecked(g.created_at)}</span><button type="button" class="guest-del" data-note="${g.id}" title="Remove this note" aria-label="Remove note">×</button></div><p>${esc(g.body)}</p></div>`).join('') || '<p class="guest-empty">No notes yet — friends and family can leave one below.</p>'}</div>
-      <div class="guest-add">
-        <input id="guestName" type="text" placeholder="Your name" maxlength="40" autocomplete="off" />
-        <textarea id="guestBody" placeholder="Leave a note about this home…" maxlength="600"></textarea>
-        <button type="button" id="guestAdd" class="lead-btn ghost">Add note</button>
-      </div>
-      <div class="guest-status" id="guestStatus"></div>
-    </div>
   </div>`;
   galShots = shots; galIndex = 0;
   box.querySelectorAll('.thumb').forEach((t, i) => t.onclick = () => {
@@ -778,24 +781,6 @@ function renderDetail() {
   noteEl.addEventListener('input', () => { document.getElementById('savedNote').textContent = noteEl.value === (p.mine?.note || '') ? '' : 'Unsaved — tap “Save note”.'; });
   noteEl.addEventListener('change', saveNote);
   noteBtn.addEventListener('click', saveNote);
-  document.getElementById('guestAdd')?.addEventListener('click', () => submitGuestNote(p));
-  box.querySelectorAll('.guest-del').forEach(b => b.onclick = () => removeGuestNote(p, b.dataset.note));
-}
-// Second opinions: anyone can leave a named note on a home. Stored shared server-side.
-async function submitGuestNote(p) {
-  const name = (document.getElementById('guestName')?.value || '').trim();
-  const body = (document.getElementById('guestBody')?.value || '').trim();
-  const status = document.getElementById('guestStatus');
-  if (!name || !body) { if (status) status.textContent = 'Add your name and a note.'; return; }
-  if (status) status.textContent = 'Saving…';
-  try {
-    const r = await fetch(`/api/properties/${encodeURIComponent(p.id)}/notes`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, body }) });
-    if (!r.ok) throw new Error();
-    await loadProperties(); renderDetail();
-  } catch { if (status) status.textContent = 'Could not save — try again.'; }
-}
-async function removeGuestNote(p, id) {
-  try { await fetch(`/api/guest-notes/${encodeURIComponent(id)}`, { method: 'DELETE' }); await loadProperties(); renderDetail(); } catch { }
 }
 
 async function onVerdict(p, verdict) {
@@ -853,7 +838,7 @@ function renderReset() {
     <li>Your brief, guardrails, search areas, commute places, move-in window, people and weekly email</li></ul>`;
   if (resetStep === 0) box.innerHTML = `<p>Wipes the slate clean for everyone in this space. Kept:</p>${kept}
     <div class="reset-actions"><button type="button" class="btn-danger outline" id="resetStart"${n ? '' : ' disabled'}>Clear all listings…</button>${n ? '' : '<span class="dest-empty">Nothing to clear.</span>'}</div><p class="add-status" id="resetStatus"></p>`;
-  else if (resetStep === 1) box.innerHTML = `<div class="reset-warn"><p><b>Step 1 of 2.</b> This removes all <b>${n} home${n === 1 ? '' : 's'}</b> (buy and rent) from the lists, map and Curate page, along with every verdict, note, second opinion and tracking detail, for everyone in this space.</p></div>
+  else if (resetStep === 1) box.innerHTML = `<div class="reset-warn"><p><b>Step 1 of 2.</b> This removes all <b>${n} home${n === 1 ? '' : 's'}</b> (buy and rent) from the lists, map and Curate page, along with every verdict, note and tracking detail, for everyone in this space.</p></div>
     <p>Nest saves a snapshot first and keeps your learned taste, so nothing you've taught it is lost.</p>
     <div class="reset-actions"><button type="button" class="btn-danger" id="resetNext">Yes, continue</button><button type="button" class="quiet-button" id="resetCancel">Cancel</button></div>`;
   else box.innerHTML = `<div class="reset-warn"><p><b>Step 2 of 2.</b> Type <b>CLEAR</b> to delete all ${n} home${n === 1 ? '' : 's'}.</p></div>

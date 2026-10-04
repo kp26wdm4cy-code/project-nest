@@ -949,7 +949,6 @@ async function rows(person, wsId) {
   const insights = (await db.execute('SELECT property_id, data FROM insights')).rows;
   const media = (await db.execute('SELECT property_id, data FROM media')).rows;
   const commutes = (await db.execute('SELECT property_id, data FROM commutes')).rows;
-  const guests = (await db.execute('SELECT rowid AS id, property_id, name, body, created_at FROM guest_notes ORDER BY created_at ASC')).rows;
   return properties.map(p => {
     const ins = insights.find(i => i.property_id === p.id);
     const med = media.find(m => m.property_id === p.id);
@@ -962,7 +961,6 @@ async function rows(person, wsId) {
       insights: ins ? JSON.parse(ins.data) : null,
       media: med ? JSON.parse(med.data) : null,
       commutes: com ? JSON.parse(com.data) : [],
-      guestNotes: guests.filter(g => g.property_id === p.id),
     };
   });
 }
@@ -1437,26 +1435,6 @@ createServer(async (req, res) => {
       if (sets.length) { args.push(tr[1]); await db.execute({ sql: `UPDATE properties SET ${sets.join(', ')} WHERE id=?`, args }); }
       return send(res, 200, JSON.stringify({ ok: true }));
     } catch { return send(res, 400, JSON.stringify({ error: 'Could not save tracking.' })); }
-  }
-  // Guest notes — anyone can leave a named comment on a home (second opinions).
-  const gn = url.pathname.match(/^\/api\/properties\/([^/]+)\/notes$/);
-  if (gn && req.method === 'POST') {
-    let body = ''; for await (const chunk of req) body += chunk;
-    try {
-      const { name, body: text } = JSON.parse(body || '{}');
-      const nm = String(name || '').trim().slice(0, 40), bd = String(text || '').trim().slice(0, 600);
-      if (!nm || !bd) return send(res, 400, JSON.stringify({ error: 'Name and note are both required.' }));
-      const exists = (await db.execute({ sql: 'SELECT 1 FROM properties WHERE id=? AND workspace_id=?', args: [gn[1], req.wsId] })).rows[0];
-      if (!exists) return send(res, 404, JSON.stringify({ error: 'No such home.' }));
-      await db.execute({ sql: 'INSERT INTO guest_notes(property_id,name,body,created_at) VALUES(?,?,?,?)', args: [gn[1], nm, bd, new Date().toISOString()] });
-      return send(res, 200, JSON.stringify({ ok: true }));
-    } catch { return send(res, 400, JSON.stringify({ error: 'Could not save that note.' })); }
-  }
-  const gd = url.pathname.match(/^\/api\/guest-notes\/(\d+)$/);
-  if (gd && req.method === 'DELETE') {
-    // Only delete a note attached to a home in the caller's workspace.
-    await db.execute({ sql: 'DELETE FROM guest_notes WHERE rowid=? AND property_id IN (SELECT id FROM properties WHERE workspace_id=?)', args: [+gd[1], req.wsId] });
-    return send(res, 200, JSON.stringify({ ok: true }));
   }
   const file = staticFile(url.pathname);
   if (!file) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
