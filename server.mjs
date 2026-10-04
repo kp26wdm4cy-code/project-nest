@@ -1202,6 +1202,19 @@ async function refresh() {
   return { availability: results };
 }
 
+// Automatic re-check (replaces the old button): runs in the background when someone
+// opens the app, when the server wakes, and with the daily discovery cron — at most
+// once every AUTO_REFRESH_HOURS. Only one run at a time.
+const AUTO_REFRESH_HOURS = 12;
+let refreshRunning = null;
+async function maybeRefresh() {
+  if (refreshRunning) return true;
+  const last = await getSetting('last_refresh_at', null);
+  if (last && Date.now() - new Date(last).getTime() < AUTO_REFRESH_HOURS * 3600e3) return false;
+  await setSetting('last_refresh_at', new Date().toISOString());   // claim the slot first
+  refreshRunning = refresh().catch(e => console.log('Auto re-check failed:', e && e.message)).finally(() => { refreshRunning = null; });
+  return true;
+}
 function staticFile(pathname) {
   const clean = pathname === '/' ? 'index.html' : pathname.slice(1);
   const full = normalize(join(root, clean));
@@ -1311,6 +1324,9 @@ createServer(async (req, res) => {
     catch (e) { return send(res, 500, JSON.stringify({ error: 'Restore failed. ' + String(e && e.message || e) })); }
   }
   if (url.pathname === '/api/rail-lines' && req.method === 'GET') return send(res, 200, JSON.stringify(await railLines()));
+  if (url.pathname === '/api/refresh-status' && req.method === 'GET')
+    return send(res, 200, JSON.stringify({ running: !!refreshRunning, lastAt: await getSetting('last_refresh_at', null) }));
+  if (url.pathname === '/api/properties' && req.method === 'GET') { maybeRefresh().catch(() => { }); }
   if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(req.user.name, req.wsId)));
   if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(req.wsId), 'text/csv; charset=utf-8');
   if (url.pathname === '/api/refresh' && req.method === 'POST') return send(res, 200, JSON.stringify(await refresh()));
@@ -1318,6 +1334,7 @@ createServer(async (req, res) => {
     const scheduled = url.searchParams.get('scheduled') === '1';
     const mode = url.searchParams.get('mode') === 'rent' ? 'rent' : 'buy';
     if (scheduled) {   // cron: discover for every workspace using each one's own brief/areas
+      maybeRefresh().catch(() => { });   // the daily cron also keeps saved homes re-checked
       try { const wss = (await db.execute('SELECT id FROM workspaces')).rows; for (const w of wss) { if (await suggestionsOn(w.id)) await discover({ max: 8, poolCap: 20, maxAreas: 14, mode, wsId: w.id }); } return send(res, 200, JSON.stringify({ scheduled: true, workspaces: wss.length, mode })); }
       catch (e) { return send(res, 200, JSON.stringify({ added: [], error: 'Scheduled discovery did not complete.' })); }
     }
@@ -1479,6 +1496,7 @@ createServer(async (req, res) => {
     const total = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
     if (have < total) { console.log('Computing area intelligence in the background…'); await refreshInsights(); console.log('Area intelligence ready.'); }
   } catch (e) { console.log('Area-intelligence bootstrap skipped:', e && e.message); }
+  try { if (await maybeRefresh()) console.log('Re-checking saved homes in the background…'); } catch { }
   try { console.log('Fetching listing galleries…'); await bootstrapMedia(); console.log('Galleries ready.'); }
   catch (e) { console.log('Gallery bootstrap skipped:', e && e.message); }
   try {

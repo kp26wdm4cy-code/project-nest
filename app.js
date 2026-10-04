@@ -187,7 +187,7 @@ function renderInsights() {
   if (!d) {
     box.innerHTML = `<div class="insight-head"><p class="kicker">AREA INTELLIGENCE</p>
       <h3>Live area data isn't compiled for this home yet.</h3></div>
-      <p class="insight-foot">Press "Check listings now" to pull it in (Land Registry, OpenStreetMap, TfL, Police.uk, Environment Agency) — it then fills automatically after each listings check.</p>`;
+      <p class="insight-foot">It fills in automatically in the background within a few minutes (Land Registry, OpenStreetMap, TfL, Police.uk, Environment Agency).</p>`;
     return;
   }
   const price = d.price;
@@ -1032,7 +1032,7 @@ function renderLeadNote() {
   const live = properties.filter(p => p.availability !== 'off-market').length;
   const last = properties.map(p => p.last_checked).filter(Boolean).sort().pop();
   const el = document.getElementById('leadStatus');
-  if (el) el.innerHTML = `<strong>${live} live lead${live === 1 ? '' : 's'}</strong><br><small>${last ? 'Availability ' + whenChecked(last) : 'Availability not checked yet — press “Check listings”.'}</small>`;
+  if (el) el.innerHTML = `<strong>${live} live lead${live === 1 ? '' : 's'}</strong><br><small>${recheckRunning ? 'Re-checking your saved homes in the background…' : (last ? 'Availability ' + whenChecked(last) + ' · re-checked automatically' : 'Homes are re-checked automatically.')}</small>`;
 }
 
 // ---- sign-in / identity --------------------------------------------------
@@ -1081,19 +1081,15 @@ function showLogin() {
   input.focus();
 }
 
-async function checkListings(btn) {
-  const original = btn.textContent;
-  btn.disabled = true; btn.textContent = 'Checking listings + area…';
+// Saved homes are re-checked automatically by the server (on open, on wake and daily,
+// at most every 12 h). While a run is going, poll quietly and reload when it's done.
+let recheckRunning = false;
+async function watchRecheck() {
   try {
-    await fetch('/api/refresh', { method: 'POST' });
-    await loadProperties();
-    renderAll();
-    btn.textContent = 'Updated ✓';
-  } catch {
-    btn.textContent = 'Check failed — retry';
-  } finally {
-    setTimeout(() => { btn.disabled = false; btn.textContent = original; }, 2500);
-  }
+    const s = await (await fetch('/api/refresh-status', { cache: 'no-store' })).json();
+    if (s.running) { recheckRunning = true; renderLeadNote(); setTimeout(watchRecheck, 15000); return; }
+    if (recheckRunning) { recheckRunning = false; await loadProperties(); renderAll(); }
+  } catch { }
 }
 
 async function submitAddUrl(btn) {
@@ -1325,7 +1321,6 @@ function bind() {
   document.getElementById('moveFrom')?.addEventListener('change', e => setMoveWindow('moveFrom', e.target.value));
   document.getElementById('moveTo')?.addEventListener('change', e => setMoveWindow('moveTo', e.target.value));
   document.getElementById('moveClear')?.addEventListener('click', () => { ui.moveFrom = ''; ui.moveTo = ''; saveUi(); renderMoveFilter(); renderList(); refreshMarkers(); saveMoveWindow(); });
-  document.getElementById('checkListings').onclick = e => checkListings(e.currentTarget);
   const addBtn = document.getElementById('addBtn');
   if (addBtn) {
     addBtn.onclick = () => submitAddUrl(addBtn);
@@ -1380,6 +1375,7 @@ function bind() {
     await loadProperties();
     renderAll();
     switchPage(ui.page);   // restore the last page (Explore / Curate & track)
+    setTimeout(watchRecheck, 1500);   // opening the app may have started an automatic re-check
   } catch (err) {
     document.getElementById('propertyList').innerHTML =
       '<p class="empty">Could not reach the Nest server. Start it with <code>npm start</code> and open this page at the address it prints.</p>';
