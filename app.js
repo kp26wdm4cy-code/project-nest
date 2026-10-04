@@ -12,7 +12,8 @@ ui.moveTo ||= '';
 ui.page = ['explore', 'curate'].includes(ui.page) ? ui.page : 'explore';  // Explore vs Curate & track
 ui.collapsed ||= {};
 ui.rail = ui.rail !== false;
-ui.lineHide = !!ui.lineHide;   // hide homes outside the "Near a line" walking circles   // coloured tube/rail lines on the map (on by default)        // collapsed state of the bottom settings blocks (default collapsed)
+ui.lineHide = !!ui.lineHide;
+ui.hideOff = !!ui.hideOff;     // hide homes whose listing has gone (sold / let / removed)   // hide homes outside the "Near a line" walking circles   // coloured tube/rail lines on the map (on by default)        // collapsed state of the bottom settings blocks (default collapsed)
 const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 
 let allProperties = [];   // every home from the server (both buy and rent)
@@ -428,7 +429,7 @@ function renderRailToggle() {
 function refreshMarkers() {
   Object.values(markers).forEach(m => map.removeLayer(m));
   markers = {};
-  const visible = properties.filter(p => statusOf(p) !== 'Pass' && inMoveWindow(p) && inLineReach(p) && bigEnough(p) && !hiddenSuggestion(p)); // hide passed, out-of-window, out-of-reach, too small, switched-off suggestions
+  const visible = properties.filter(p => statusOf(p) !== 'Pass' && inMoveWindow(p) && inLineReach(p) && bigEnough(p) && !hiddenSuggestion(p) && !(ui.hideOff && p.availability === 'off-market')); // hide passed, out-of-window, out-of-reach, too small, switched-off suggestions
   // Some homes only geocode to their postcode-district centre, so several can land on
   // the exact same point. Fan those out in a small ring so none hides behind another.
   const groups = {};
@@ -670,6 +671,7 @@ function included(p, filter) {
   if (!inMoveWindow(p)) return false;                  // move-in window narrows the active tabs
   if (!inLineReach(p)) return false;                   // so does "hide homes outside the circles"
   if (!bigEnough(p) || hiddenSuggestion(p)) return false;   // min size, and suggestions switched off
+  if (ui.hideOff && p.availability === 'off-market') return false;
   if (filter === 'queue') return s === 'queue';
   if (filter === 'kept') return s === 'Love' || s === 'View' || s === 'Watch';
   return false;
@@ -1017,6 +1019,13 @@ function renderMoveFilter() {
     }
   }
 }
+function renderOffToggle() {
+  const cb = document.getElementById('hideOff'), cnt = document.getElementById('offCount');
+  if (!cb) return;
+  cb.checked = ui.hideOff;
+  const n = properties.filter(p => p.availability === 'off-market' && statusOf(p) !== 'Pass').length;
+  if (cnt) cnt.textContent = n ? `(${n})` : '(none right now)';
+}
 function setMoveWindow(which, val) {
   ui[which] = val || ''; saveUi();
   renderMoveFilter(); renderList(); refreshMarkers();
@@ -1285,7 +1294,7 @@ function renderCurate() {
 }
 
 function renderAll() {
-  renderModeSwitch(); renderModeChrome(); renderMoveFilter();
+  renderModeSwitch(); renderModeChrome(); renderMoveFilter(); renderOffToggle();
   renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote(); renderCurate(); renderReset(); renderLineNote();
 }
 // Explore vs Curate & track pages.
@@ -1320,6 +1329,7 @@ function bind() {
   document.querySelectorAll('#modeSwitch button').forEach(b => b.onclick = () => switchMode(b.dataset.mode));
   document.getElementById('moveFrom')?.addEventListener('change', e => setMoveWindow('moveFrom', e.target.value));
   document.getElementById('moveTo')?.addEventListener('change', e => setMoveWindow('moveTo', e.target.value));
+  document.getElementById('hideOff')?.addEventListener('change', e => { ui.hideOff = e.target.checked; saveUi(); renderOffToggle(); renderList(); refreshMarkers(); });
   document.getElementById('moveClear')?.addEventListener('click', () => { ui.moveFrom = ''; ui.moveTo = ''; saveUi(); renderMoveFilter(); renderList(); refreshMarkers(); saveMoveWindow(); });
   const addBtn = document.getElementById('addBtn');
   if (addBtn) {
