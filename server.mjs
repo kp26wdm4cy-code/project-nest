@@ -100,7 +100,27 @@ function extractSize(html) {
   if (rm) { const m = +rm[1]; if (m >= 10 && m <= 5000) return `${m} sq m`; }
   const rf = html.match(/sqft\\?",\\?"sq\.?\s*ft\.?\\?",(\d{3,6})/i);
   if (rf) { const f = +rf[1]; if (f >= 100 && f <= 100000) return `${Math.round(f * 0.092903)} sq m`; }
-  return null;
+  // Some listings only carry it as e.g. "minimumArea":"992 sq ft / 92 sq m".
+  const ma = html.match(/minimumArea\\?"\s*:\s*\\?"([^"\\]{3,40})/i);
+  if (ma) { const s = sizeFromText(ma[1], 10); if (s) return s; }
+  // Last resort: the agent's own words in the description / key features
+  // ("spans approximately 749 sqft", "722 Square Feet (Approximately)").
+  return sizeFromText(html.replace(/<[^>]+>/g, ' '), 25);
+}
+// Largest plausible floor area mentioned in free text, in sq m. Small figures (balconies,
+// gardens, single rooms) are ignored by the `floor` minimum.
+function sizeFromText(text, floor) {
+  const re = /(\d{1,2}(?:,\d{3})|\d{2,5}(?:\.\d+)?)\s*(sq\.?\s*f(?:ee)?t\.?|sqft|square\s*f(?:ee|oo)t|sq\.?\s*m(?:etres|eters)?\b\.?|sqm|m²|square\s*met(?:re|er)s)/gi;
+  let best = null;
+  const t = String(text);
+  for (const m of t.matchAll(re)) {
+    // Skip figures describing part of the home or its outside space ("garden 30 sq m").
+    if (/(garden|terrace|balcon|patio|roof|yard|plot|land|bed ?room|room|kitchen|living|reception|lounge|storage|loft|garage|shed|office)\b[^.\d]{0,25}$/i.test(t.slice(Math.max(0, m.index - 40), m.index))) continue;
+    const n = +m[1].replace(/,/g, ''), ft = /f/i.test(m[2]);
+    const sqm = Math.round(ft ? n * 0.092903 : n);
+    if (sqm >= floor && sqm <= 500 && (best == null || sqm > best)) best = sqm;
+  }
+  return best != null ? `${best} sq m` : null;
 }
 // Turn a human date ("15 December 2026", "15th Dec 2026", "now") into an ISO date.
 function parseHumanDate(s) {
