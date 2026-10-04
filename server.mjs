@@ -351,7 +351,7 @@ async function addListing(listingUrl, opts = {}) {
         await db.execute({ sql: `INSERT INTO insights(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), data.computedAt] });
       } catch { }
     })();
-    (async () => { try { const dests = await getDestinations(wsId); if (dests.length) await storeCommutes(id, await computeCommutes({ latitude: lat, longitude: lng }, dests)); } catch { } })();
+    updateCommutes(wsId).catch(() => { });   // background: commute times for the new home
     // Last-sold price is a purchase concept — skip it for rentals.
     if (!rent) (async () => { try { const sold = await fetchSold(ex.postcode, ex.area, { price: ex.price, flat: /flat|apartment|maison|studio/i.test(ex.type) }); if (sold) await db.execute({ sql: 'UPDATE properties SET last_sold_price=?, last_sold_date=?, last_sold_exact=? WHERE id=?', args: [sold.price, sold.date, sold.exact ? 1 : 0, id] }); } catch { } })();
   }
@@ -813,16 +813,42 @@ async function computeCommutes(property, destinations) {
 async function storeCommutes(id, data) {
   await db.execute({ sql: `INSERT INTO commutes(property_id,data,computed_at) VALUES(?,?,?) ON CONFLICT(property_id) DO UPDATE SET data=excluded.data,computed_at=excluded.computed_at`, args: [id, JSON.stringify(data), new Date().toISOString()] });
 }
+// Keep every home's commute times in step with the space's places, automatically.
+// Per home, results for places already computed are reused; only new places (or ones that
+// failed last time) hit TfL, and removed places are simply dropped. One job per workspace;
+// a change arriving mid-run triggers another pass. Progress is exposed for the page.
+const commuteJobs = new Map();   // wsId -> { running, done, total, again }
+const destKey = d => `${d.name}|${d.postcode}`;
+async function updateCommutes(wsId) {
+  const cur = commuteJobs.get(wsId);
+  if (cur && cur.running) { cur.again = true; return; }
+  const job = { running: true, done: 0, total: 0, again: false };
+  commuteJobs.set(wsId, job);
+  try {
+    do {
+      job.again = false;
+      const dests = await getDestinations(wsId), want = dests.map(destKey).join(';');
+      const props = (await db.execute({ sql: 'SELECT p.id, p.latitude, p.longitude, c.data FROM properties p LEFT JOIN commutes c ON c.property_id=p.id WHERE p.workspace_id=?', args: [wsId] })).rows;
+      const todo = props.map(p => ({ p, have: (() => { try { return JSON.parse(p.data || 'null'); } catch { return null; } })() }))
+        .filter(({ have }) => !Array.isArray(have) || have.map(destKey).join(';') !== want || have.some(c => c.minutes == null && c.cycleMinutes == null));
+      job.total = todo.length; job.done = 0;
+      for (const { p, have } of todo) {
+        try {
+          const ok = new Map((have || []).filter(c => c.minutes != null || c.cycleMinutes != null).map(c => [destKey(c), c]));
+          const missing = dests.filter(d => !ok.has(destKey(d)));
+          const fresh = missing.length ? await computeCommutes(p, missing) : [];
+          fresh.forEach(c => ok.set(destKey(c), c));
+          await storeCommutes(p.id, dests.map(d => ok.get(destKey(d)) || { name: d.name, postcode: d.postcode, minutes: null, cycleMinutes: null }));
+        } catch { }
+        job.done++;
+        if (job.again) break;   // places changed again — start over with the new list
+      }
+    } while (job.again);
+  } finally { job.running = false; }
+}
 async function refreshCommutes(only) {
-  // Each workspace has its own commute destinations, so recompute per workspace.
   const wss = only ? [{ id: only }] : (await db.execute('SELECT id FROM workspaces')).rows;
-  for (const w of wss) {
-    const dests = await getDestinations(w.id);
-    const props = (await db.execute({ sql: 'SELECT id, latitude, longitude FROM properties WHERE workspace_id=?', args: [w.id] })).rows;
-    for (const p of props) {
-      try { await storeCommutes(p.id, dests.length ? await computeCommutes(p, dests) : []); } catch { }
-    }
-  }
+  for (const w of wss) await updateCommutes(w.id).catch(() => { });
 }
 // Re-geocode saved homes to their exact street postcode. Older/discovered listings that
 // only had an outcode landed on the district centroid (several stacking on one point);
@@ -1250,6 +1276,7 @@ async function refresh(ids) {
     }
   }
   planSizes(items.map(i => i.id));   // background: floor-plan sizes for homes still marked TBC
+  if (!ids) refreshCommutes().catch(() => { });   // and any missing / failed / out-of-date commute times
   if (!ids) refreshInsights().catch(() => {}); // recompute area data in the background (new homes already compute theirs on add)
   return { availability: results };
 }
@@ -1376,6 +1403,10 @@ createServer(async (req, res) => {
     catch (e) { return send(res, 500, JSON.stringify({ error: 'Restore failed. ' + String(e && e.message || e) })); }
   }
   if (url.pathname === '/api/rail-lines' && req.method === 'GET') return send(res, 200, JSON.stringify(await railLines()));
+  if (url.pathname === '/api/commute-status' && req.method === 'GET') {
+    const j = commuteJobs.get(req.wsId) || {};
+    return send(res, 200, JSON.stringify({ running: !!j.running, done: j.done || 0, total: j.total || 0 }));
+  }
   if (url.pathname === '/api/refresh-status' && req.method === 'GET')
     return send(res, 200, JSON.stringify({ running: !!refreshRunning, lastAt: await getSetting('last_refresh_at', null) }));
   if (url.pathname === '/api/properties' && req.method === 'GET') { maybeRefresh().catch(() => { }); }
@@ -1554,7 +1585,7 @@ createServer(async (req, res) => {
   try {
     const have = (await db.execute('SELECT COUNT(*) AS n FROM commutes')).rows[0].n;
     const total = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
-    if (have < total) { console.log('Computing commute times…'); await refreshCommutes(); console.log('Commutes ready.'); }
+    console.log('Checking commute times…'); await refreshCommutes(); console.log('Commutes up to date.');
   } catch (e) { console.log('Commute bootstrap skipped:', e && e.message); }
 })();
 

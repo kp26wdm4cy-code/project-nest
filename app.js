@@ -500,8 +500,30 @@ async function saveDestinations() {
     const s = await (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ destinations }) })).json();
     destinations = s.destinations || destinations; renderDestChips();
   } catch { }
-  // commute times recompute server-side in the background — reload to show them
-  if (destinations.length) setTimeout(async () => { await loadProperties(); renderAll(); }, 6500);
+  watchCommutes(true);   // commute times recompute server-side — follow along until done
+}
+// Follow the server's commute job: show progress, pull in times as they arrive, and do a
+// final reload when it finishes. `expect` = we just changed something, so keep polling
+// briefly even if the job hasn't registered as running yet.
+let commuteWatching = false;
+async function watchCommutes(expect) {
+  if (commuteWatching) return; commuteWatching = true;
+  const st = () => document.getElementById('commuteStatus');
+  let sawRun = false, grace = expect ? 3 : 0;
+  try {
+    for (;;) {
+      let s = { running: false };
+      try { s = await (await fetch('/api/commute-status', { cache: 'no-store' })).json(); } catch { }
+      if (s.running) {
+        sawRun = true;
+        if (st()) st().textContent = `Updating commute times… ${s.done}/${s.total} homes`;
+        await loadProperties(); renderDetail(); renderCurate();
+      } else if (grace-- > 0 && !sawRun) { /* not started yet */ }
+      else break;
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    if (sawRun || expect) { await loadProperties(); renderAll(); if (st()) { st().textContent = destinations.length ? 'Commute times are up to date.' : ''; setTimeout(() => { if (st()) st().textContent = ''; }, 4000); } }
+  } finally { commuteWatching = false; }
 }
 function addDest() {
   const nEl = document.getElementById('destName'), pEl = document.getElementById('destPostcode');
@@ -1097,7 +1119,7 @@ async function watchRecheck() {
   try {
     const s = await (await fetch('/api/refresh-status', { cache: 'no-store' })).json();
     if (s.running) { recheckRunning = true; renderLeadNote(); setTimeout(watchRecheck, 15000); return; }
-    if (recheckRunning) { recheckRunning = false; await loadProperties(); renderAll(); }
+    if (recheckRunning) { recheckRunning = false; await loadProperties(); renderAll(); watchCommutes(true); }
   } catch { }
 }
 
@@ -1125,7 +1147,7 @@ async function submitAddUrl(btn) {
       status.textContent = data.existing ? `“${data.name}” is already on your list.` : `Added “${data.name}” to your ${ui.mode === 'rent' ? 'Rent' : 'Buy'} list. Photos are in; area data is filling in — press it again in a moment if the panel is still loading.`;
       document.querySelector('.tab.active')?.classList.remove('active');
       document.querySelector('.tab[data-filter="queue"]')?.classList.add('active');
-      renderAll();
+      renderAll(); watchCommutes(true);
       document.getElementById('propertyDetail')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   } catch { status.classList.add('err'); status.textContent = 'Something went wrong adding that link.'; }
@@ -1153,7 +1175,7 @@ async function submitDiscover(btn) {
       await loadProperties();
       document.querySelector('.tab.active')?.classList.remove('active');
       document.querySelector('.tab[data-filter="queue"]')?.classList.add('active');
-      renderAll();
+      renderAll(); watchCommutes(true);
     }
   } catch { status.classList.add('err'); status.textContent = 'The search could not complete — Rightmove may be rate-limiting. Try again shortly.'; }
   finally { btn.disabled = false; btn.textContent = orig; }
@@ -1386,6 +1408,7 @@ function bind() {
     renderAll();
     switchPage(ui.page);   // restore the last page (Explore / Curate & track)
     setTimeout(watchRecheck, 1500);   // opening the app may have started an automatic re-check
+    setTimeout(() => watchCommutes(false), 2500);   // …or a commute top-up
   } catch (err) {
     document.getElementById('propertyList').innerHTML =
       '<p class="empty">Could not reach the Nest server. Start it with <code>npm start</code> and open this page at the address it prints.</p>';
