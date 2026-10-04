@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
@@ -410,6 +410,7 @@ function parseSearchResults(html) {
       addr: p.displayAddress || '',
       summary: p.summary || '',
       outcode: (String(p.displayAddress || '').match(/\b([A-Z]{1,2}\d[A-Z\d]?)\b/g) || []).slice(-1)[0] || null,
+      lat: p.location && p.location.latitude, lng: p.location && p.location.longitude,
     };
   }).filter(p => p.id && p.price);
 }
@@ -427,6 +428,46 @@ function inWindow(date, w) {
   if (w.from && a < w.from) return false;
   if (w.to && a > w.to) return false;
   return true;
+}
+// "Near a line": only suggest homes within N minutes' walk of a station on the chosen
+// lines. Walking = 80 m/min (4.8 km/h) along streets ~1.25x longer than a straight line,
+// so the straight-line catchment radius is minutes * 80 / 1.25 m (the map draws the same).
+const WALK_M_PER_MIN = 80, STREET_FACTOR = 1.25;
+const catchmentMetres = minutes => minutes * WALK_M_PER_MIN / STREET_FACTOR;
+async function getLineTarget(wsId) {
+  const t = await wsGet(wsId, 'line_target', null) || {};
+  const lines = (Array.isArray(t.lines) ? t.lines : []).filter(l => RAIL_LINES[l]);
+  return { lines, minutes: Math.min(30, Math.max(1, Math.round(+t.minutes || 5))) };
+}
+const haversineM = (a, b) => {
+  const R = 6371000, r = x => x * Math.PI / 180;
+  const dLat = r(b.lat - a.lat), dLng = r(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+};
+// Nearest station on the target lines, with an estimated walking time.
+function nearestOnLines(pt, stations) {
+  let best = null;
+  for (const s of stations) { const d = haversineM(pt, s); if (!best || d < best.d) best = { d, s }; }
+  return best && { station: best.s.name, lines: best.s.lines, metres: Math.round(best.d), minutes: Math.max(1, Math.round(best.d * STREET_FACTOR / WALK_M_PER_MIN)) };
+}
+// Postcode districts that a line's walking catchments fall in (station + 4 compass points
+// at the radius), so the search goes straight to the right places along the line.
+let districtShapes = null;
+function districtsFor(points) {
+  if (!districtShapes) {
+    try { districtShapes = JSON.parse(readFileSync(join(root, 'districts.geojson'), 'utf8')).features.map(f => ({ name: f.properties.name, polys: f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates })); }
+    catch { districtShapes = []; }
+  }
+  const inRing = (x, y, ring) => { let c = false; for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) { const [xi, yi] = ring[i], [xj, yj] = ring[j]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; } return c; };
+  const out = new Set();
+  for (const p of points) for (const d of districtShapes) if (d.polys.some(poly => inRing(p.lng, p.lat, poly[0]))) { out.add(d.name); break; }
+  return [...out];
+}
+function catchmentDistricts(stations, radiusM) {
+  const dLat = radiusM / 111320;
+  const pts = stations.flatMap(s => { const dLng = radiusM / (111320 * Math.cos(s.lat * Math.PI / 180)); return [s, { lat: s.lat + dLat, lng: s.lng }, { lat: s.lat - dLat, lng: s.lng }, { lat: s.lat, lng: s.lng + dLng }, { lat: s.lat, lng: s.lng - dLng }]; });
+  return districtsFor(pts);
 }
 async function getSearchDistricts(wsId) {
   const d = await wsGet(wsId, 'search_districts', null);
@@ -456,9 +497,23 @@ async function discover(opts = {}) {
   const taste = await buildTaste(mode, wsId);
   // Sample across the FULL selected search area, not just the first few — shuffle the whole
   // list so each run covers a different, wider spread of the selected districts.
-  const allAreas = await getSearchDistricts(wsId);
+  let allAreas = await getSearchDistricts(wsId);
+  // Near-a-line target: search the districts along the chosen lines (the ones inside the
+  // selected search areas if any overlap, otherwise the whole line), and keep only homes
+  // within the walking catchment of one of its stations.
+  const target = await getLineTarget(wsId);
+  let targetStations = null, radius = 0, lineAreas = [];
+  if (target.lines.length) {
+    const rail = await railLines();
+    targetStations = rail.stations.filter(s => s.lines && s.lines.some(l => target.lines.includes(l)));
+    radius = catchmentMetres(target.minutes);
+    lineAreas = catchmentDistricts(targetStations, radius);
+    const overlap = lineAreas.filter(a => allAreas.includes(a));
+    if (lineAreas.length) allAreas = overlap.length ? overlap : lineAreas;
+  }
   const shuffled = allAreas.slice().sort(() => Math.random() - 0.5);
   const areas = shuffled.slice(0, opts.maxAreas || 12);
+  let outOfReach = 0;
   const searchPath = mode === 'rent' ? 'property-to-rent' : 'property-for-sale';
   const existing = new Set((await db.execute({ sql: 'SELECT listing_url FROM properties WHERE workspace_id=?', args: [wsId] })).rows
     .map(r => (String(r.listing_url).match(/(\d{5,})/) || [])[1]).filter(Boolean));
@@ -472,6 +527,12 @@ async function discover(opts = {}) {
         seen.add(c.id);
         if (c.price > brief.maxPrice || c.price < minPrice) continue;    // floor drops shared-ownership / per-room teasers
         if (c.beds != null && brief.beds.length && !brief.beds.includes(c.beds)) continue; // != null so a studio (0 beds) is filtered, unknown beds pass
+        if (targetStations) {
+          if (c.lat == null || c.lng == null) { outOfReach++; continue; }
+          const near = nearestOnLines({ lat: c.lat, lng: c.lng }, targetStations);
+          if (!near || near.metres > radius) { outOfReach++; continue; }
+          c.near = near;
+        }
         candidates.push(c);
       }
     } catch { }
@@ -480,6 +541,11 @@ async function discover(opts = {}) {
   const scored = candidates.map(c => {
     const ex = { price: c.price, beds: c.beds, outcode: c.outcode, area: c.addr, descr: `${c.summary} ${c.type}` };
     const s = scoreCandidate(ex, taste, brief);
+    if (c.near) {   // closer to the line ranks a little higher; say so in the "why"
+      s.score += Math.max(0, (target.minutes - c.near.minutes) * 1.5);
+      const names = c.near.lines.filter(l => target.lines.includes(l)).map(l => lineLabel(l)).join(' / ');
+      s.why = [`${c.near.minutes} min walk to ${c.near.station} (${names})`, ...s.why].slice(0, 2);
+    }
     return { id: c.id, url: `https://www.rightmove.co.uk/properties/${c.id}`, score: s.score, why: s.why };
   }).sort((a, b) => b.score - a.score);
   // With a move-in window set, a listing's date is only known once its page is read, so
@@ -495,7 +561,8 @@ async function discover(opts = {}) {
     await sleep(600);
   }
   if (opts.poolCap) await capSuggestions(opts.poolCap, mode, wsId);
-  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode, outOfWindow, window: windowOn ? win : null };
+  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode, outOfWindow, window: windowOn ? win : null,
+    lineTarget: targetStations ? { ...target, stations: targetStations.length, outOfReach } : null };
 }
 
 // Database selection:
@@ -1001,6 +1068,8 @@ async function restoreArchive(wsId, id) {
   await wsSet(wsId, 'taste_memory', a.priorMemory || {});
   return { ok: true, restored: back.length, skipped: a.properties.length - back.length };
 }
+const LINE_NAMES = { 'hammersmith-city': 'Hammersmith & City line', 'waterloo-city': 'Waterloo & City line', dlr: 'DLR', elizabeth: 'Elizabeth line' };
+const lineLabel = id => LINE_NAMES[id] || id[0].toUpperCase() + id.slice(1) + ' line';
 let railCache = null, railFetching = null;
 async function railLines() {
   if (railCache && Date.now() - railCache.at < 24 * 3600e3) return railCache.data;
@@ -1021,7 +1090,8 @@ async function railLines() {
         if (paths.length) lines.push({ id, name: j.lineName || id, colour, paths });
         for (const seq of j.stopPointSequences || []) for (const st of seq.stopPoint || []) {
           const k = st.topMostParentId || st.stationId || st.id;
-          if (!stations.has(k)) stations.set(k, { name: String(st.name || '').replace(/ (Underground|DLR|Rail) Station$| Station$/, ''), lat: r5(st.lat), lng: r5(st.lon) });
+          if (!stations.has(k)) stations.set(k, { name: String(st.name || '').replace(/ (Underground|DLR|Rail) Station$| Station$/, ''), lat: r5(st.lat), lng: r5(st.lon), lines: [] });
+          if (!stations.get(k).lines.includes(id)) stations.get(k).lines.push(id);
         }
       } catch { }
     }));
@@ -1249,6 +1319,7 @@ createServer(async (req, res) => {
       emails: await wsGet(req.wsId, 'emails', []), briefs: await getBriefs(req.wsId),
       guardrails: await wsGet(req.wsId, 'guardrails', DEFAULT_GUARDRAILS),
       moveWindow: await getMoveWindow(req.wsId),
+      lineTarget: await getLineTarget(req.wsId),
       tasteMemory: memorySummary(await wsGet(req.wsId, 'taste_memory', {})),
       archives: await listArchives(req.wsId),
       space: { id: req.wsId, name: await workspaceName(req.wsId), people: await workspacePeople(req.wsId) }, you: normEmail(req.user.email),
@@ -1293,6 +1364,10 @@ createServer(async (req, res) => {
         await setSetting('allowed_users', [...byEmail.values()].slice(0, 50));
       }
       if (typeof b.guardrails === 'string') await wsSet(ws, 'guardrails', b.guardrails.trim().slice(0, 400));
+      if (b.lineTarget && typeof b.lineTarget === 'object') {
+        const lines = (Array.isArray(b.lineTarget.lines) ? b.lineTarget.lines : []).filter(l => RAIL_LINES[l]).slice(0, 6);
+        await wsSet(ws, 'line_target', { lines, minutes: Math.min(30, Math.max(1, Math.round(+b.lineTarget.minutes || 5))) });
+      }
       if (b.moveWindow && typeof b.moveWindow === 'object') {
         const iso = v => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) ? v : '';
         await wsSet(ws, 'move_window', { from: iso(b.moveWindow.from), to: iso(b.moveWindow.to) });

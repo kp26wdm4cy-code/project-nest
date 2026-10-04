@@ -82,6 +82,13 @@
         <button type="button" id="discoverBtn" class="lead-btn ghost">✨ Suggest homes that fit us</button>
         <small>Searches Rightmove and adds the top matches, ranked by what you two have liked so far.</small>
       </div>
+      <div class="line-target" id="lineTarget" aria-label="Only suggest homes near a tube line">
+        <span class="lt-label">🚇 Near a line</span>
+        <span id="ltChips" class="lt-chips"></span>
+        <select id="ltAdd" aria-label="Add a line"><option value="">+ Add a line…</option></select>
+        <label class="lt-walk" id="ltWalk">Walk ≤ <input type="range" id="ltMinutes" min="1" max="20" step="1" value="5" aria-label="Walking minutes to a station" /> <b id="ltMinLabel">5 min</b></label>
+        <p class="lt-note" id="ltNote"></p>
+      </div>
       <p id="addStatus" class="add-status">Add a home and Nest pulls in its photos, floor plan and area intelligence — or let it suggest homes from what you’ve liked.</p>
     </section>
 

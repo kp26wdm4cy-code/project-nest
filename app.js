@@ -29,6 +29,8 @@ let allowedUsers = [];   // emails permitted to sign in ({email,name}) — host 
 let isHost = false;      // whether the signed-in user administers the global sign-in list
 let tasteMemory = {};    // taste Nest remembers from cleared listings ({buy,rent}: {count, areas, priceCenter})
 let archives = [];       // saved snapshots from "Start fresh"
+let lineTarget = { lines: [], minutes: 5 };   // "Near a line": suggest only homes within N min walk of these lines
+let railData = null, catchLayer = null, saveLineTimer;
 let resetStep = 0;       // 0 = idle, 1 = first warning, 2 = type CLEAR
 let guardrails = 'Outdoor space preferred. No noisy roads or poor light. No ground floor unless secure/gated. Ex-local authority is considered.';
 
@@ -295,15 +297,21 @@ function initMap() {
   window.setTimeout(() => map.invalidateSize(), 150);
   refreshMarkers();
   if (ui.rail) loadRail();
+  renderLineTarget();   // walking circles need the map, so draw them once it exists
   renderRailToggle();
 }
 // Coloured tube / Elizabeth / Overground / DLR lines (from TfL via /api/rail-lines).
 // Drawn in their own pane under the pins; station dots appear once zoomed in.
 let railLayer = null, stationLayer = null;
+async function getRail() {
+  if (railData) return railData;
+  try { const d = await (await fetch('/api/rail-lines')).json(); if (d.lines && d.lines.length) railData = d; } catch { }
+  return railData;
+}
 async function loadRail() {
   if (railLayer) { railLayer.addTo(map); syncStations(); return; }
   try {
-    const d = await (await fetch('/api/rail-lines')).json();
+    const d = await getRail(); if (!d) return;
     if (!d.lines || !d.lines.length) return;
     if (!map.getPane('railPane')) map.createPane('railPane').style.zIndex = 390;
     railLayer = L.layerGroup(d.lines.flatMap(l => l.paths.map(pts =>
@@ -319,6 +327,65 @@ function syncStations() {
   const show = ui.rail && map.getZoom() >= 13;
   if (show && !map.hasLayer(stationLayer)) stationLayer.addTo(map);
   if (!show && map.hasLayer(stationLayer)) map.removeLayer(stationLayer);
+}
+// ---- Near a line: pick lines + a walking time; the map shades each station's catchment
+// and "Suggest…" only adds homes inside it. Same walking model as the server:
+// 80 m/min along streets ~1.25x a straight line → circle radius = min * 64 m.
+const catchRadius = min => min * 80 / 1.25;
+const distM = (a, b) => { const R = 6371000, r = x => x * Math.PI / 180, dLat = r(b.lat - a.lat), dLng = r(b.lng - a.lng); return 2 * R * Math.asin(Math.sqrt(Math.sin(dLat / 2) ** 2 + Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLng / 2) ** 2)); };
+const targetStations = () => (railData?.stations || []).filter(s => s.lines && s.lines.some(l => lineTarget.lines.includes(l)));
+const lineInfo = id => (railData?.lines || []).find(l => l.id === id);
+async function renderLineTarget() {
+  const box = document.getElementById('lineTarget'); if (!box) return;
+  await getRail();
+  const on = lineTarget.lines.length > 0;
+  box.classList.toggle('on', on);
+  const sel = document.getElementById('ltAdd');
+  const avail = (railData?.lines || []).filter(l => !lineTarget.lines.includes(l.id)).sort((a, b) => a.name.localeCompare(b.name));
+  sel.innerHTML = `<option value="">${on ? '+ Add another line…' : '+ Choose a line…'}</option>` + avail.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join('');
+  document.getElementById('ltChips').innerHTML = lineTarget.lines.map(id => { const l = lineInfo(id); return `<span class="lt-chip"><i style="background:${l ? l.colour : '#999'}"></i>${esc(l ? l.name : id)}<button type="button" data-line="${id}" aria-label="Remove line">×</button></span>`; }).join('');
+  document.getElementById('ltChips').querySelectorAll('[data-line]').forEach(b => b.onclick = () => { lineTarget.lines = lineTarget.lines.filter(x => x !== b.dataset.line); saveLineTarget(); renderLineTarget(); });
+  document.getElementById('ltMinutes').value = lineTarget.minutes;
+  document.getElementById('ltMinLabel').textContent = lineTarget.minutes + ' min';
+  drawCatchments();
+  renderLineNote();
+}
+function renderLineNote() {
+  const note = document.getElementById('ltNote'); if (!note) return;
+  if (!lineTarget.lines.length) { note.textContent = 'Pick a line to only suggest homes within walking distance of its stations. The walking circles show on the map.'; return; }
+  const st = targetStations(), r = catchRadius(lineTarget.minutes);
+  const near = properties.filter(p => p.latitude != null && st.some(s => distM({ lat: p.latitude, lng: p.longitude }, s) <= r)).length;
+  note.textContent = `“Suggest…” now only adds homes about ${lineTarget.minutes} min walk or less from one of ${st.length} stations, searching the districts along the line. ${near} of the ${properties.length} homes you already have are inside the circles.`;
+}
+function drawCatchments(fit) {
+  if (!map) return;
+  if (catchLayer) { map.removeLayer(catchLayer); catchLayer = null; }
+  if (!lineTarget.lines.length || !railData) return;
+  if (!map.getPane('railPane')) map.createPane('railPane').style.zIndex = 390;
+  const r = catchRadius(lineTarget.minutes);
+  catchLayer = L.layerGroup(targetStations().map(s => {
+    const l = lineInfo(s.lines.find(x => lineTarget.lines.includes(x)));
+    return L.circle([s.lat, s.lng], { pane: 'railPane', radius: r, color: l ? l.colour : '#285b43', weight: 1, opacity: 0.7, fillOpacity: 0.13, interactive: false });
+  })).addTo(map);
+  if (fit) { const b = L.featureGroup(catchLayer.getLayers()).getBounds(); if (b.isValid()) map.fitBounds(b, { padding: [30, 30] }); }
+}
+function saveLineTarget() {
+  clearTimeout(saveLineTimer);
+  saveLineTimer = setTimeout(() => fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lineTarget }) }).catch(() => { }), 400);
+}
+function initLineTarget() {
+  document.getElementById('ltAdd')?.addEventListener('change', e => {
+    const id = e.target.value; if (!id) return;
+    lineTarget.lines = [...lineTarget.lines, id]; saveLineTarget(); renderLineTarget().then(() => drawCatchments(true));
+  });
+  const slider = document.getElementById('ltMinutes');
+  slider?.addEventListener('input', () => {   // live: resize circles without rebuilding
+    lineTarget.minutes = +slider.value;
+    document.getElementById('ltMinLabel').textContent = lineTarget.minutes + ' min';
+    catchLayer?.eachLayer(c => c.setRadius(catchRadius(lineTarget.minutes)));
+    renderLineNote();
+  });
+  slider?.addEventListener('change', saveLineTarget);
 }
 function toggleRail() {
   ui.rail = !ui.rail; saveUi();
@@ -359,7 +426,7 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; tasteMemory = s.tasteMemory || {}; archives = s.archives || []; if (s.moveWindow && (s.moveWindow.from !== ui.moveFrom || s.moveWindow.to !== ui.moveTo)) { ui.moveFrom = s.moveWindow.from || ''; ui.moveTo = s.moveWindow.to || ''; saveUi(); if (map) { renderMoveFilter(); renderList(); refreshMarkers(); } } if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; tasteMemory = s.tasteMemory || {}; archives = s.archives || []; if (s.lineTarget) lineTarget = s.lineTarget; if (s.moveWindow && (s.moveWindow.from !== ui.moveFrom || s.moveWindow.to !== ui.moveTo)) { ui.moveFrom = s.moveWindow.from || ''; ui.moveTo = s.moveWindow.to || ''; saveUi(); if (map) { renderMoveFilter(); renderList(); refreshMarkers(); } } if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
   renderModeChrome();
   renderGuardrails();
   updateAreaToggle();
@@ -371,6 +438,7 @@ async function loadSettings() {
   renderUserChip();
   renderReset();
   renderLearning();
+  renderLineTarget();
 }
 // Collapsible bottom blocks (commute, sharing, sign-in, weekly email) — collapsed by
 // default, remembered per block, with a Show/Hide toggle in the header (like Compare).
@@ -1055,13 +1123,15 @@ async function submitDiscover(btn) {
   const orig = btn.textContent;
   btn.disabled = true; btn.textContent = 'Searching Rightmove…';
   status.classList.remove('err');
-  status.textContent = `Reading ${noun} across your brief areas and ranking them by what you and Hannah have liked — this can take up to a minute…`;
+  status.textContent = lineTarget.lines.length
+    ? `Reading ${noun} along the ${lineTarget.lines.map(id => lineInfo(id)?.name || id).join(' / ')}, keeping those within ${lineTarget.minutes} min walk of a station — this can take up to a minute…`
+    : `Reading ${noun} across your brief areas and ranking them by what you and Hannah have liked — this can take up to a minute…`;
   try {
     const res = await fetch(`/api/discover?mode=${encodeURIComponent(ui.mode)}`, { method: 'POST' });
     const data = await res.json();
     if (data.error) { status.classList.add('err'); status.textContent = data.error; }
     else if (!data.added || !data.added.length) {
-      status.textContent = data.outOfWindow ? `Looked at ${data.considered || 0} ${noun} — the best ${data.outOfWindow} weren't free inside your move-in window, so nothing was added. Try again soon, or widen the window.` : `Looked at ${data.considered || 0} ${noun} across your areas — nothing new beat what you already have. Try again in a day or two as fresh listings come on, or widen your brief.`;
+      status.textContent = (data.lineTarget && !data.considered) ? `Nothing new within ${data.lineTarget.minutes} min walk of the line this time (${data.lineTarget.outOfReach} listings were further away). Try a longer walk on the slider, or run it again — each run samples different districts along the line.` : data.outOfWindow ? `Looked at ${data.considered || 0} ${noun} — the best ${data.outOfWindow} weren't free inside your move-in window, so nothing was added. Try again soon, or widen the window.` : `Looked at ${data.considered || 0} ${noun} across your areas — nothing new beat what you already have. Try again in a day or two as fresh listings come on, or widen your brief.`;
     } else {
       status.textContent = `Added ${data.added.length} ${ui.mode === 'rent' ? 'rental' : 'home'} suggestion${data.added.length > 1 ? 's' : ''}: ${data.added.map(a => '“' + a.name + '”').join(', ')} — look for the ✨ Suggested tag, and each explains why.`;
       ui.filter = 'queue'; saveUi();
@@ -1210,7 +1280,7 @@ function renderCurate() {
 
 function renderAll() {
   renderModeSwitch(); renderModeChrome(); renderMoveFilter();
-  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote(); renderCurate(); renderReset();
+  renderList(); renderDetail(); renderInsights(); refreshMarkers(); renderLearning(); renderBrief(); renderLeadNote(); renderCurate(); renderReset(); renderLineNote();
 }
 // Explore vs Curate & track pages.
 function switchPage(page) {
@@ -1256,6 +1326,7 @@ function bind() {
   document.getElementById('areaToggle')?.addEventListener('click', toggleAreas);
   document.getElementById('zoomExtent')?.addEventListener('click', fitToProperties);
   document.getElementById('railToggle')?.addEventListener('click', toggleRail);
+  initLineTarget();
   document.querySelectorAll('#pageNav button').forEach(b => b.onclick = () => switchPage(b.dataset.page));
   initCollapsibles();
   document.getElementById('destAdd')?.addEventListener('click', addDest);
