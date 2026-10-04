@@ -122,6 +122,49 @@ function sizeFromText(text, floor) {
   }
   return best != null ? `${best} sq m` : null;
 }
+// Floor-plan text (from OCR): prefer a labelled total ("Gross Internal Area 697 Sq Ft",
+// "TOTAL: 70.3m²" — OCR often turns ² into ? or 2), else any plausible total area.
+function sizeFromPlanText(text) {
+  const re = /(?:total|gross\s+internal\s+area|internal\s+area|floor\s+area|\bG\.?I\.?A\b)[^0-9\n]{0,20}(\d{1,2},\d{3}|\d{2,5}(?:\.\d+)?)\s*(sq\.?\s*f(?:ee)?t|sqft|sq\.?\s*m|sqm|m[²2?]?(?![a-z]))/gi;
+  let best = null;
+  for (const m of String(text).matchAll(re)) {
+    const n = +m[1].replace(/,/g, ''), sqm = Math.round(/f/i.test(m[2]) ? n * 0.092903 : n);
+    if (sqm >= 15 && sqm <= 500 && (best == null || sqm > best)) best = sqm;
+  }
+  return best != null ? `${best} sq m` : sizeFromText(text, 25);
+}
+// Read the size off the floor plan image for homes whose listing doesn't state one.
+// Uses tesseract.js (loaded only when needed). One OCR batch at a time keeps memory low,
+// and each floor plan is read once (size_plan_checked remembers which image was tried).
+let planQueue = Promise.resolve();
+function planSizes(ids) {
+  planQueue = planQueue.then(() => planSizesNow(ids)).catch(e => console.log('Floor-plan size read failed:', e && e.message));
+  return planQueue;
+}
+async function planSizesNow(ids) {
+  if (!ids || !ids.length) return;
+  const rows = (await db.execute({ sql: `SELECT p.id, p.size, p.size_plan_checked, m.data FROM properties p JOIN media m ON m.property_id=p.id WHERE p.id IN (${ids.map(() => '?').join(',')})`, args: ids })).rows;
+  const todo = rows.map(r => ({ id: r.id, plans: (JSON.parse(r.data || '{}').floorplans || []), r }))
+    .filter(x => x.plans.length && (!x.r.size || /tbc/i.test(x.r.size)) && x.r.size_plan_checked !== x.plans[0]);
+  if (!todo.length) return;
+  const { createWorker } = await import('tesseract.js');
+  const worker = await createWorker('eng');
+  try {
+    for (const x of todo) {
+      let found = null;
+      for (const url of x.plans.slice(0, 3)) {
+        try {
+          const img = Buffer.from(await (await fetch(url, { headers: { 'User-Agent': BROWSER_UA }, signal: AbortSignal.timeout(20000) })).arrayBuffer());
+          const { data } = await worker.recognize(img);
+          found = sizeFromPlanText(data.text);
+          if (found) break;
+        } catch { }
+      }
+      await db.execute({ sql: 'UPDATE properties SET size=COALESCE(?, size), size_plan_checked=? WHERE id=?', args: [found, x.plans[0], x.id] });
+      if (found) console.log(`Floor plan size for ${x.id}: ${found}`);
+    }
+  } finally { await worker.terminate(); }
+}
 // Turn a human date ("15 December 2026", "15th Dec 2026", "now") into an ISO date.
 function parseHumanDate(s) {
   const t = String(s || '').trim().replace(/(\d+)(?:st|nd|rd|th)/i, '$1');
@@ -301,6 +344,7 @@ async function addListing(listingUrl, opts = {}) {
         ex.channel || 'buy', ex.availableFrom || null, wsId],
     });
     if (ex.media.photos.length || ex.media.floorplans.length) await storeMedia(id, ex.media);
+    if (!ex.size && ex.media.floorplans.length) planSizes([id]);   // background: size from the floor plan image
     (async () => {
       try {
         const data = await computeInsights({ latitude: lat, longitude: lng, price: ex.price, area: areaLabel, flat: /flat|apartment|maison|studio/i.test(ex.type), rent }, { tflKey });
@@ -637,7 +681,7 @@ async function initialise() {
   for (const col of ['prev_price INTEGER', 'price_changed_at TEXT', 'suggest_score REAL', 'tenure TEXT', 'lease_years INTEGER',
     'listed_date TEXT', 'listed_reason TEXT', 'last_sold_price INTEGER', 'last_sold_date TEXT', 'last_sold_exact INTEGER',
     "listing_type TEXT NOT NULL DEFAULT 'buy'", 'available_from TEXT', 'workspace_id TEXT',
-    'contacted INTEGER DEFAULT 0', 'agent_contact TEXT', 'track_stage TEXT', 'track_notes TEXT']) {
+    'contacted INTEGER DEFAULT 0', 'agent_contact TEXT', 'track_stage TEXT', 'track_notes TEXT', 'size_plan_checked TEXT']) {
     try { await db.execute(`ALTER TABLE properties ADD COLUMN ${col}`); } catch { /* already exists */ }
   }
   const count = (await db.execute('SELECT COUNT(*) AS n FROM properties')).rows[0].n;
@@ -1205,6 +1249,7 @@ async function refresh(ids) {
       results.push({ id: item.id, status: 'needs-check' });
     }
   }
+  planSizes(items.map(i => i.id));   // background: floor-plan sizes for homes still marked TBC
   if (!ids) refreshInsights().catch(() => {}); // recompute area data in the background (new homes already compute theirs on add)
   return { availability: results };
 }

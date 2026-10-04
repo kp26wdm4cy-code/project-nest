@@ -5,3 +5,6 @@ data/*.sqlite-wal
 data/*.sqlite-shm
 *.log
 .DS_Store
+
+# OCR language data cached by tesseract.js at runtime
+*.traineddata
