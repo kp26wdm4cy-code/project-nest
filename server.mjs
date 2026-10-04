@@ -250,6 +250,7 @@ async function addListing(listingUrl, opts = {}) {
   if (lat == null) { const geo = await geocode(ex.postcode, ex.outcode); if (geo) { lat = geo.lat; lng = geo.lng; district = geo.district; } }
   if (lat == null) return { error: 'Could not work out the location from that page. A Rightmove link works best.' };
   if (!ex.price) return { error: 'Could not read the price from that page.' };
+  if (opts.window && !inWindow(ex.availableFrom, opts.window)) return { ok: false, skipped: 'window', availableFrom: ex.availableFrom };
   const wsId = opts.wsId || DEFAULT_WS;
   const rmId = (u.href.match(/(\d{5,})/) || [])[1];
   const prefix = /rightmove/i.test(u.hostname) ? 'rm-' : /zoopla/i.test(u.hostname) ? 'zp-' : /onthemarket/i.test(u.hostname) ? 'otm-' : 'pl-';
@@ -375,6 +376,21 @@ function parseSearchResults(html) {
     };
   }).filter(p => p.id && p.price);
 }
+// Shared move-in window ({from,to} ISO dates, '' = open) — the same window the app's
+// date filter shows, so "Suggest…" and the daily search only add homes free in it.
+async function getMoveWindow(wsId) {
+  const w = await wsGet(wsId, 'move_window', null) || {};
+  return { from: w.from || '', to: w.to || '' };
+}
+// Same rule as the front-end filter: unknown dates pass; available-now counts as today.
+function inWindow(date, w) {
+  if (!w || (!w.from && !w.to) || !date) return true;
+  const today = new Date().toISOString().slice(0, 10);
+  const a = date < today ? today : date;
+  if (w.from && a < w.from) return false;
+  if (w.to && a > w.to) return false;
+  return true;
+}
 async function getSearchDistricts(wsId) {
   const d = await wsGet(wsId, 'search_districts', null);
   return (Array.isArray(d) && d.length) ? d : DEFAULT_DISTRICTS;
@@ -429,14 +445,20 @@ async function discover(opts = {}) {
     const s = scoreCandidate(ex, taste, brief);
     return { id: c.id, url: `https://www.rightmove.co.uk/properties/${c.id}`, score: s.score, why: s.why };
   }).sort((a, b) => b.score - a.score);
-  const added = [];
-  for (const t of scored.slice(0, max)) {
-    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief'), score: t.score, wsId }).catch(() => null);
+  // With a move-in window set, a listing's date is only known once its page is read, so
+  // try further down the ranking (bounded) to make up for ones that fall outside it.
+  const win = await getMoveWindow(wsId);
+  const windowOn = !!(win.from || win.to);
+  const added = []; let outOfWindow = 0;
+  for (const t of scored.slice(0, windowOn ? max * 3 : max)) {
+    if (added.length >= max) break;
+    const r = await addListing(t.url, { reason: (t.why[0] || 'it fits your brief'), score: t.score, wsId, window: windowOn ? win : null }).catch(() => null);
+    if (r && r.skipped === 'window') outOfWindow++;
     if (r && r.ok && !r.existing) added.push({ name: r.name, why: t.why });
     await sleep(600);
   }
   if (opts.poolCap) await capSuggestions(opts.poolCap, mode, wsId);
-  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode };
+  return { added, considered: candidates.length, found: seen.size, learnedFrom: taste.count, areas, mode, outOfWindow, window: windowOn ? win : null };
 }
 
 // Database selection:
@@ -874,6 +896,45 @@ async function refreshInsights() {
   return done;
 }
 
+// Coloured rail lines for the map: TfL route sequences (station-to-station lines +
+// stations), fetched once and cached. Colours are TfL's published line colours.
+const RAIL_LINES = {
+  bakerloo: '#B36305', central: '#E32017', circle: '#FFD300', district: '#00782A',
+  'hammersmith-city': '#F3A9BB', jubilee: '#A0A5A9', metropolitan: '#9B0056', northern: '#000000',
+  piccadilly: '#003688', victoria: '#0098D4', 'waterloo-city': '#95CDBA', elizabeth: '#6950A1',
+  dlr: '#00A4A7', liberty: '#676767', lioness: '#F1B41C', mildmay: '#437EC1',
+  suffragette: '#39B97A', weaver: '#972861', windrush: '#EF4D5E',
+};
+let railCache = null, railFetching = null;
+async function railLines() {
+  if (railCache && Date.now() - railCache.at < 24 * 3600e3) return railCache.data;
+  if (railFetching) return railFetching;
+  railFetching = (async () => {
+    const r5 = n => Math.round(n * 1e5) / 1e5;
+    const lines = [], stations = new Map();
+    await Promise.all(Object.entries(RAIL_LINES).map(async ([id, colour]) => {
+      try {
+        const j = await (await fetch(`https://api.tfl.gov.uk/Line/${id}/Route/Sequence/all${tflKey ? '?app_key=' + tflKey : ''}`, { signal: AbortSignal.timeout(20000) })).json();
+        const seen = new Set(), paths = [];
+        for (const ls of j.lineStrings || []) for (const path of JSON.parse(ls)) {
+          const pts = path.map(([lng, lat]) => [r5(lat), r5(lng)]);
+          const key = JSON.stringify(pts), rev = JSON.stringify(pts.slice().reverse());
+          if (seen.has(key) || seen.has(rev)) continue;
+          seen.add(key); paths.push(pts);
+        }
+        if (paths.length) lines.push({ id, name: j.lineName || id, colour, paths });
+        for (const seq of j.stopPointSequences || []) for (const st of seq.stopPoint || []) {
+          const k = st.topMostParentId || st.stationId || st.id;
+          if (!stations.has(k)) stations.set(k, { name: String(st.name || '').replace(/ (Underground|DLR|Rail) Station$| Station$/, ''), lat: r5(st.lat), lng: r5(st.lon) });
+        }
+      } catch { }
+    }));
+    const data = { lines, stations: [...stations.values()] };
+    if (lines.length) railCache = { at: Date.now(), data };
+    return data;
+  })();
+  try { return await railFetching; } finally { railFetching = null; }
+}
 function send(res, code, body, type = 'application/json; charset=utf-8') { res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store' }); res.end(body); }
 function csv(value) { const text = value == null ? '' : String(value); return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
 
@@ -1043,6 +1104,7 @@ createServer(async (req, res) => {
     req.wsId = await userWorkspace(u);
   }
 
+  if (url.pathname === '/api/rail-lines' && req.method === 'GET') return send(res, 200, JSON.stringify(await railLines()));
   if (url.pathname === '/api/properties' && req.method === 'GET') return send(res, 200, JSON.stringify(await rows(req.user.name, req.wsId)));
   if (url.pathname === '/api/export.csv' && req.method === 'GET') return send(res, 200, await exportCsv(req.wsId), 'text/csv; charset=utf-8');
   if (url.pathname === '/api/refresh' && req.method === 'POST') return send(res, 200, JSON.stringify(await refresh()));
@@ -1072,6 +1134,7 @@ createServer(async (req, res) => {
       searchDistricts: await getSearchDistricts(req.wsId), destinations: await getDestinations(req.wsId),
       emails: await wsGet(req.wsId, 'emails', []), briefs: await getBriefs(req.wsId),
       guardrails: await wsGet(req.wsId, 'guardrails', DEFAULT_GUARDRAILS),
+      moveWindow: await getMoveWindow(req.wsId),
       space: { id: req.wsId, name: await workspaceName(req.wsId), people: await workspacePeople(req.wsId) }, you: normEmail(req.user.email),
       isHost: host,
       ...(host ? { allowedUsers: await getAllowed() } : {}),   // the global sign-in list is host-only
@@ -1114,6 +1177,10 @@ createServer(async (req, res) => {
         await setSetting('allowed_users', [...byEmail.values()].slice(0, 50));
       }
       if (typeof b.guardrails === 'string') await wsSet(ws, 'guardrails', b.guardrails.trim().slice(0, 400));
+      if (b.moveWindow && typeof b.moveWindow === 'object') {
+        const iso = v => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) ? v : '';
+        await wsSet(ws, 'move_window', { from: iso(b.moveWindow.from), to: iso(b.moveWindow.to) });
+      }
       if (typeof b.spaceName === 'string' && b.spaceName.trim()) await db.execute({ sql: 'UPDATE workspaces SET name=? WHERE id=?', args: [b.spaceName.trim().slice(0, 60), ws] });
       let invited = 0;
       if (Array.isArray(b.spacePeople)) {

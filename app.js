@@ -10,7 +10,8 @@ ui.mode = MODES.includes(ui.mode) ? ui.mode : 'buy';   // Buy vs Rent — a top-
 ui.moveFrom ||= '';    // move-in window filter (ISO dates, '' = open)
 ui.moveTo ||= '';
 ui.page = ['explore', 'curate'].includes(ui.page) ? ui.page : 'explore';  // Explore vs Curate & track
-ui.collapsed ||= {};        // collapsed state of the bottom settings blocks (default collapsed)
+ui.collapsed ||= {};
+ui.rail = ui.rail !== false;   // coloured tube/rail lines on the map (on by default)        // collapsed state of the bottom settings blocks (default collapsed)
 const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
 
 let allProperties = [];   // every home from the server (both buy and rent)
@@ -290,6 +291,40 @@ function initMap() {
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
   window.setTimeout(() => map.invalidateSize(), 150);
   refreshMarkers();
+  if (ui.rail) loadRail();
+  renderRailToggle();
+}
+// Coloured tube / Elizabeth / Overground / DLR lines (from TfL via /api/rail-lines).
+// Drawn in their own pane under the pins; station dots appear once zoomed in.
+let railLayer = null, stationLayer = null;
+async function loadRail() {
+  if (railLayer) { railLayer.addTo(map); syncStations(); return; }
+  try {
+    const d = await (await fetch('/api/rail-lines')).json();
+    if (!d.lines || !d.lines.length) return;
+    if (!map.getPane('railPane')) map.createPane('railPane').style.zIndex = 390;
+    railLayer = L.layerGroup(d.lines.flatMap(l => l.paths.map(pts =>
+      L.polyline(pts, { pane: 'railPane', color: l.colour, weight: 3.5, opacity: 0.8, lineCap: 'round' }).bindTooltip(l.name, { sticky: true, className: 'dist-tip' }))));
+    stationLayer = L.layerGroup(d.stations.map(s =>
+      L.circleMarker([s.lat, s.lng], { pane: 'railPane', radius: 3, color: '#24402f', weight: 1.5, fillColor: '#fff', fillOpacity: 1 }).bindTooltip(s.name, { className: 'dist-tip' })));
+    if (ui.rail) { railLayer.addTo(map); syncStations(); }
+    map.on('zoomend', syncStations);
+  } catch { }
+}
+function syncStations() {
+  if (!stationLayer) return;
+  const show = ui.rail && map.getZoom() >= 13;
+  if (show && !map.hasLayer(stationLayer)) stationLayer.addTo(map);
+  if (!show && map.hasLayer(stationLayer)) map.removeLayer(stationLayer);
+}
+function toggleRail() {
+  ui.rail = !ui.rail; saveUi();
+  if (ui.rail) loadRail(); else { if (railLayer) map.removeLayer(railLayer); syncStations(); }
+  renderRailToggle();
+}
+function renderRailToggle() {
+  const b = document.getElementById('railToggle'); if (!b) return;
+  b.classList.toggle('active', ui.rail); b.textContent = ui.rail ? '🚇 Tube lines on' : '🚇 Tube lines';
 }
 function refreshMarkers() {
   Object.values(markers).forEach(m => map.removeLayer(m));
@@ -321,7 +356,7 @@ function fitToProperties() {
 
 // ---- search-area districts (map boundaries) ------------------------------
 async function loadSettings() {
-  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
+  try { const s = await (await fetch('/api/settings', { cache: 'no-store' })).json(); selectedDistricts = new Set(s.searchDistricts || []); destinations = s.destinations || []; subscribedEmails = s.emails || []; if (s.briefs) briefs = s.briefs; allowedUsers = s.allowedUsers || []; isHost = !!s.isHost; if (s.guardrails != null) guardrails = s.guardrails; if (s.moveWindow && (s.moveWindow.from !== ui.moveFrom || s.moveWindow.to !== ui.moveTo)) { ui.moveFrom = s.moveWindow.from || ''; ui.moveTo = s.moveWindow.to || ''; saveUi(); if (map) { renderMoveFilter(); renderList(); refreshMarkers(); } } if (s.space) { currentWorkspace = { id: s.space.id, name: s.space.name }; spacePeople = s.space.people || []; } } catch { }
   renderModeChrome();
   renderGuardrails();
   updateAreaToggle();
@@ -633,6 +668,7 @@ function renderDetail() {
     <p>One tap is enough. Add a reason if you have one — it is saved for everyone.${others ? ` <b class="partner">${others}</b>` : ''}</p>
     <div class="reaction-buttons">${['Love', 'View', 'Watch', 'Pass'].map(v => `<button data-verdict="${v}" class="${mine.verdict === v ? 'selected' : ''}">${verdictText(v)}</button>`).join('')}</div>
     <textarea id="note" placeholder="What works or puts you off? e.g. 'living room feels dark'">${mine.note || ''}</textarea>
+    <div class="note-actions"><button type="button" id="noteSave" class="lead-btn">Save note</button></div>
     <div class="saved-note" id="savedNote">${mine.verdict || mine.note ? 'Saved on the shared server.' : ''}</div>
     <div class="guest-notes">
       <p class="kicker">SECOND OPINIONS</p>
@@ -655,10 +691,20 @@ function renderDetail() {
   document.getElementById('galMain')?.addEventListener('click', () => openLightbox(galIndex));
   box.querySelectorAll('[data-verdict]').forEach(b => b.onclick = () => onVerdict(p, b.dataset.verdict));
   document.getElementById('removeHome')?.addEventListener('click', () => removeProperty(p));
-  document.getElementById('note').addEventListener('change', async e => {
-    try { await saveFeedback(p, { note: e.target.value }); document.getElementById('savedNote').textContent = 'Note saved on the shared server.'; renderLearning(); }
-    catch { document.getElementById('savedNote').textContent = 'Could not save — is the server running?'; }
-  });
+  // Explicit Save button (iPads/phones don't reliably fire "change" on blur); saving on
+  // change stays as a fallback for desktop. Skips the request if nothing changed.
+  const noteEl = document.getElementById('note'), noteBtn = document.getElementById('noteSave');
+  const saveNote = async () => {
+    const st = document.getElementById('savedNote');
+    if (noteEl.value === (p.mine?.note || '')) { st.textContent = 'Note saved on the shared server.'; return; }
+    noteBtn.disabled = true; st.textContent = 'Saving…';
+    try { await saveFeedback(p, { note: noteEl.value }); st.textContent = 'Note saved on the shared server.'; renderLearning(); }
+    catch { st.textContent = 'Could not save — is the server running?'; }
+    finally { noteBtn.disabled = false; }
+  };
+  noteEl.addEventListener('input', () => { document.getElementById('savedNote').textContent = noteEl.value === (p.mine?.note || '') ? '' : 'Unsaved — tap “Save note”.'; });
+  noteEl.addEventListener('change', saveNote);
+  noteBtn.addEventListener('click', saveNote);
   document.getElementById('guestAdd')?.addEventListener('click', () => submitGuestNote(p));
   box.querySelectorAll('.guest-del').forEach(b => b.onclick = () => removeGuestNote(p, b.dataset.note));
 }
@@ -828,13 +874,19 @@ function renderMoveFilter() {
     if (!on) note.textContent = '';
     else {
       const hidden = properties.filter(p => statusOf(p) !== 'Pass' && !inMoveWindow(p)).length;
-      note.textContent = hidden ? `Hiding ${hidden} home${hidden === 1 ? '' : 's'} available outside this window.` : 'Every home falls inside this window.';
+      note.textContent = (hidden ? `Hiding ${hidden} home${hidden === 1 ? '' : 's'} available outside this window.` : 'Every home falls inside this window.') + ' “Suggest…” and the daily search only add homes free in it.';
     }
   }
 }
 function setMoveWindow(which, val) {
   ui[which] = val || ''; saveUi();
   renderMoveFilter(); renderList(); refreshMarkers();
+  saveMoveWindow();
+}
+// The window is shared across the space (and devices) and drives the "Suggest…" search
+// and the daily auto-search, so new suggestions are homes free inside it.
+async function saveMoveWindow() {
+  try { await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ moveWindow: { from: ui.moveFrom, to: ui.moveTo } }) }); } catch { }
 }
 
 function renderLeadNote() {
@@ -948,7 +1000,7 @@ async function submitDiscover(btn) {
     const data = await res.json();
     if (data.error) { status.classList.add('err'); status.textContent = data.error; }
     else if (!data.added || !data.added.length) {
-      status.textContent = `Looked at ${data.considered || 0} ${noun} across your areas — nothing new beat what you already have. Try again in a day or two as fresh listings come on, or widen your brief.`;
+      status.textContent = data.outOfWindow ? `Looked at ${data.considered || 0} ${noun} — the best ${data.outOfWindow} weren't free inside your move-in window, so nothing was added. Try again soon, or widen the window.` : `Looked at ${data.considered || 0} ${noun} across your areas — nothing new beat what you already have. Try again in a day or two as fresh listings come on, or widen your brief.`;
     } else {
       status.textContent = `Added ${data.added.length} ${ui.mode === 'rent' ? 'rental' : 'home'} suggestion${data.added.length > 1 ? 's' : ''}: ${data.added.map(a => '“' + a.name + '”').join(', ')} — look for the ✨ Suggested tag, and each explains why.`;
       ui.filter = 'queue'; saveUi();
@@ -1131,7 +1183,7 @@ function bind() {
   document.querySelectorAll('#modeSwitch button').forEach(b => b.onclick = () => switchMode(b.dataset.mode));
   document.getElementById('moveFrom')?.addEventListener('change', e => setMoveWindow('moveFrom', e.target.value));
   document.getElementById('moveTo')?.addEventListener('change', e => setMoveWindow('moveTo', e.target.value));
-  document.getElementById('moveClear')?.addEventListener('click', () => { ui.moveFrom = ''; ui.moveTo = ''; saveUi(); renderMoveFilter(); renderList(); refreshMarkers(); });
+  document.getElementById('moveClear')?.addEventListener('click', () => { ui.moveFrom = ''; ui.moveTo = ''; saveUi(); renderMoveFilter(); renderList(); refreshMarkers(); saveMoveWindow(); });
   document.getElementById('checkListings').onclick = e => checkListings(e.currentTarget);
   const addBtn = document.getElementById('addBtn');
   if (addBtn) {
@@ -1142,6 +1194,7 @@ function bind() {
   if (discoverBtn) discoverBtn.onclick = () => submitDiscover(discoverBtn);
   document.getElementById('areaToggle')?.addEventListener('click', toggleAreas);
   document.getElementById('zoomExtent')?.addEventListener('click', fitToProperties);
+  document.getElementById('railToggle')?.addEventListener('click', toggleRail);
   document.querySelectorAll('#pageNav button').forEach(b => b.onclick = () => switchPage(b.dataset.page));
   initCollapsibles();
   document.getElementById('destAdd')?.addEventListener('click', addDest);
