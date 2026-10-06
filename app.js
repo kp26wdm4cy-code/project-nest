@@ -15,6 +15,10 @@ ui.rail = ui.rail !== false;
 ui.lineHide = !!ui.lineHide;
 ui.hideOff = !!ui.hideOff;     // hide homes whose listing has gone (sold / let / removed)   // hide homes outside the "Near a line" walking circles   // coloured tube/rail lines on the map (on by default)        // collapsed state of the bottom settings blocks (default collapsed)
 const saveUi = () => localStorage.setItem('nest-ui', JSON.stringify(ui));
+// Phone layout (matches the max-width:760px breakpoint in styles.css).
+const isPhone = () => matchMedia('(max-width:760px)').matches;
+// On a phone the detail panel sits below the map + cards, so bring it into view after a tap.
+const showDetailOnPhone = () => { if (isPhone()) document.getElementById('propertyDetail')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
 
 let allProperties = [];   // every home from the server (both buy and rent)
 let properties = [];      // current-mode slice — everything downstream reads this
@@ -709,6 +713,7 @@ function renderList() {
     list = list.slice().sort((a, b) => fitMap.get(b.id) - fitMap.get(a.id));
   }
   const box = document.getElementById('propertyList');
+  const keepLeft = box.scrollLeft;   // phone cards scroll sideways — don't jump back to the first one
   box.innerHTML = list.length ? list.map(p => {
     const others = othersInline(p);
     const av = availInfo(p);
@@ -719,7 +724,11 @@ function renderList() {
       <span><i class="status-dot ${markerClass(p)}"></i>${label(statusOf(p))}${fs}${others ? ` · <b class="partner">${others}</b>` : ''}</span>
     </button>`;
   }).join('') : '<p class="empty">Nothing here yet. Switch tab or add a home — verdicts are saved on the shared server.</p>';
-  box.querySelectorAll('.property-item').forEach(b => b.onclick = () => select(b.dataset.id));
+  box.querySelectorAll('.property-item').forEach(b => b.onclick = () => { select(b.dataset.id); showDetailOnPhone(); });
+  box.scrollLeft = keepLeft;
+  const active = isPhone() && box.querySelector('.property-item.active');
+  if (active && (active.offsetLeft < box.scrollLeft || active.offsetLeft + active.offsetWidth > box.scrollLeft + box.clientWidth))
+    box.scrollTo({ left: active.offsetLeft - 16, behavior: 'smooth' });
   renderCounts();
 }
 function renderCounts() {
@@ -1378,12 +1387,27 @@ function bind() {
     lb.querySelector('.lb-next').onclick = e => { e.stopPropagation(); lbStep(1); };
     document.getElementById('lbImg').onclick = e => { e.stopPropagation(); toggleZoom(); };
     lb.addEventListener('click', e => { if (e.target === lb) closeLightbox(); });
+    // Swipe left/right to step through photos on touch screens (not while zoomed — that pans).
+    let touchX = null, touchY = null;
+    lb.addEventListener('touchstart', e => { if (e.touches.length === 1) { touchX = e.touches[0].clientX; touchY = e.touches[0].clientY; } }, { passive: true });
+    lb.addEventListener('touchend', e => {
+      if (touchX == null || lb.classList.contains('zoomed')) return;
+      const dx = e.changedTouches[0].clientX - touchX, dy = e.changedTouches[0].clientY - touchY;
+      touchX = null;
+      if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.5) { e.preventDefault(); lbStep(dx < 0 ? 1 : -1); }
+    });
     document.addEventListener('keydown', e => {
       if (lb.hidden) return;
       if (e.key === 'Escape') closeLightbox();
       else if (e.key === 'ArrowLeft') lbStep(-1);
       else if (e.key === 'ArrowRight') lbStep(1);
     });
+  }
+  // Phone: a floating "↑ Homes" pill once you've scrolled past the map + cards.
+  const toList = document.getElementById('toListBtn'), ws = document.querySelector('.workspace');
+  if (toList && ws && 'IntersectionObserver' in window) {
+    new IntersectionObserver(([e]) => { toList.hidden = e.isIntersecting || e.boundingClientRect.top > 0 || document.getElementById('pageExplore').hidden; }).observe(ws);
+    toList.onclick = () => document.querySelector('.queue-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
   renderUserChip();
 }
