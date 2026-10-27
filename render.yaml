@@ -9,7 +9,7 @@ services:
     startCommand: npm start
     envVars:
       - key: NODE_VERSION
-        value: 22.11.0
+        value: 22.23.4
       # The two Turso secrets below are set in the Render dashboard, not here.
       - key: TURSO_DATABASE_URL
         sync: false
